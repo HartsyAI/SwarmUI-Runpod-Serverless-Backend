@@ -9,52 +9,51 @@ namespace Hartsy.Extensions.RunPodServerless;
 /// <summary>Permissions for the RunPod Serverless extension.</summary>
 public static class RunPodPermissions
 {
-    public static readonly PermInfoGroup RunPodPermGroup = new("RunPodServerless",
+    public static readonly PermInfoGroup RunPodPermGroup = new PermInfoGroup("RunPodServerless",
         "Permissions related to RunPod serverless GPU backends.");
 
-    public static readonly PermInfo PermUseRunPod = Permissions.Register(new("use_runpod_serverless", "Use RunPod Serverless",
+    public static readonly PermInfo PermUseRunPod = Permissions.Register(new PermInfo("use_runpod_serverless", "Use RunPod Serverless",
         "Allows using RunPod's serverless GPU endpoints for image generation.",
         PermissionDefault.POWERUSERS, RunPodPermGroup));
 }
 
-// NOTE: Classname must match filename.
+/// <summary>RunPod Serverless Backend Extension - Provides serverless GPU inference via RunPod.</summary>
 public class RunPodServerlessExtension : Extension
 {
     public override void OnPreInit()
     {
-        Logs.Init("Initializing RunPod Serverless Backend (scaffold)...");
-        // TODO: If/when you add client assets, register here, e.g.:
-        // ScriptFiles.Add("Assets/runpod.js");
+        Logs.Init("Initializing RunPod Serverless Backend Extension...");
     }
 
     public override void OnInit()
     {
-        // Register the backend type so it appears in Server -> Backends Add Dropdown.
+        // Register the backend type so it appears in Server -> Backends
         Program.Backends.RegisterBackendType<RunPodServerlessBackend>(
             "runpod_serverless",
             "RunPod Serverless",
-            "Serverless GPU inference via RunPod with S3-based model discovery.",
+            "Serverless GPU inference via RunPod with direct SwarmUI API access. Supports on-demand scaling and cost-effective generation.",
             CanLoadFast: true
         );
 
-        // Register RunPod API key type so it can be managed in User Settings
+        // Register RunPod API key type for user management
         BasicAPIFeatures.AcceptedAPIKeyTypes.Add("runpod_api");
+
         try
         {
             if (!UserUpstreamApiKeys.KeysByType.ContainsKey("runpod_api"))
             {
-                UserUpstreamApiKeys.Register(new(
+                UserUpstreamApiKeys.Register(new UserUpstreamApiKeys.UserUpstreamAPIKeyType(
                     KeyType: "runpod_api",
                     JSPrefix: "runpod",
                     Title: "RunPod",
                     CreateLink: "https://www.runpod.io/console/user/settings",
-                    InfoHtml: new HtmlString("To use RunPod Serverless with SwarmUI, set your RunPod API key here.")
+                    InfoHtml: new HtmlString("Enter your RunPod API key to use RunPod Serverless backends. Get your API key from <a href='https://www.runpod.io/console/user/settings' target='_blank'>RunPod Settings</a>.")
                 ));
-                Logs.Verbose("Registered RunPod API key type.");
+                Logs.Info("Registered RunPod API key type in user settings.");
             }
             else
             {
-                Logs.Verbose("RunPod API key type already registered, skipping.");
+                Logs.Verbose("RunPod API key type already registered.");
             }
         }
         catch (Exception ex)
@@ -64,7 +63,7 @@ public class RunPodServerlessExtension : Extension
 
         // Register REST API endpoints
         RunPodWebAPI.Register();
-        
-        Logs.Info("RunPod Serverless Backend extension loaded.");
+
+        Logs.Info("RunPod Serverless Backend extension loaded successfully.");
     }
 }

@@ -10,71 +10,60 @@ namespace Hartsy.Extensions.RunPodServerless.Utils;
 /// <summary>Client for interacting with RunPod serverless endpoints and workers.</summary>
 public class RunPodApiClient
 {
-    private static readonly HttpClient _httpClient = new()
+    public static readonly HttpClient HttpClient = new HttpClient
     {
-        Timeout = TimeSpan.FromSeconds(30)
+        Timeout = TimeSpan.FromSeconds(120)
     };
 
-    private readonly string _apiKey;
-    private readonly string _endpointId;
+    public readonly string ApiKey;
+    public readonly string EndpointId;
 
     public RunPodApiClient(string apiKey, string endpointId)
     {
-        _apiKey = apiKey ?? throw new ArgumentNullException(nameof(apiKey));
-        _endpointId = endpointId ?? throw new ArgumentNullException(nameof(endpointId));
+        ApiKey = apiKey ?? throw new ArgumentNullException(nameof(apiKey));
+        EndpointId = endpointId ?? throw new ArgumentNullException(nameof(endpointId));
     }
 
-    /// <summary>Wake up worker and optionally keep it alive.</summary>
+    /// <summary>Wake up worker with keepalive. Returns immediately after initiating wakeup.</summary>
     /// <param name="keepaliveDuration">How long to keep worker alive in seconds (default: 3600)</param>
     /// <param name="keepaliveInterval">Ping interval in seconds (default: 30)</param>
-    public async Task<WorkerInfo> WakeupWorkerAsync(int keepaliveDuration = 3600, int keepaliveInterval = 30, CancellationToken cancel = default)
+    public async Task WakeupWorkerAsync(int keepaliveDuration = 3600, int keepaliveInterval = 30, CancellationToken cancel = default)
     {
-        var payload = new
+        JObject payload = new JObject
         {
-            input = new
+            ["input"] = new JObject
             {
-                action = "wakeup",
-                duration = keepaliveDuration,
-                interval = keepaliveInterval
+                ["action"] = "wakeup",
+                ["duration"] = keepaliveDuration,
+                ["interval"] = keepaliveInterval
             }
         };
 
-        JObject response = await CallRunPodHandlerAsync(payload, useSync: false, cancel);
-        
-        if (response["success"]?.Value<bool>() != true)
-        {
-            string error = response["error"]?.ToString() ?? "Unknown error";
-            throw new Exception($"Worker wakeup failed: {error}");
-        }
-
-        return new WorkerInfo
-        {
-            PublicUrl = response["public_url"]?.ToString(),
-            SessionId = response["session_id"]?.ToString(),
-            WorkerId = response["worker_id"]?.ToString(),
-            Version = response["version"]?.ToString()
-        };
+        // Use async endpoint - this returns immediately and runs keepalive in background
+        Logs.Verbose($"[RunPodApiClient] Sending wakeup signal (duration: {keepaliveDuration}s, interval: {keepaliveInterval}s)");
+        await CallRunPodHandlerAsync(payload, useSync: false, cancel);
     }
 
     /// <summary>Check if worker is ready for generation.</summary>
     public async Task<WorkerReadyResponse> CheckWorkerReadyAsync(CancellationToken cancel = default)
     {
-        var payload = new
+        JObject payload = new JObject
         {
-            input = new
+            ["input"] = new JObject
             {
-                action = "ready"
+                ["action"] = "ready"
             }
         };
 
         JObject response = await CallRunPodHandlerAsync(payload, useSync: true, cancel);
-        
+
         return new WorkerReadyResponse
         {
             Ready = response["ready"]?.Value<bool>() ?? false,
             PublicUrl = response["public_url"]?.ToString(),
             SessionId = response["session_id"]?.ToString(),
             WorkerId = response["worker_id"]?.ToString(),
+            Version = response["version"]?.ToString(),
             Error = response["error"]?.ToString()
         };
     }
@@ -84,11 +73,11 @@ public class RunPodApiClient
     {
         try
         {
-            var payload = new
+            JObject payload = new JObject
             {
-                input = new
+                ["input"] = new JObject
                 {
-                    action = "health"
+                    ["action"] = "health"
                 }
             };
 
@@ -101,60 +90,72 @@ public class RunPodApiClient
         }
     }
 
-    /// <summary>Send keepalive to worker.</summary>
+    /// <summary>Send keepalive to extend worker lifetime.</summary>
     public async Task KeepAliveAsync(int duration = 3600, int interval = 30, CancellationToken cancel = default)
     {
-        var payload = new
+        JObject payload = new JObject
         {
-            input = new
+            ["input"] = new JObject
             {
-                action = "keepalive",
-                duration,
-                interval
+                ["action"] = "keepalive",
+                ["duration"] = duration,
+                ["interval"] = interval
             }
         };
 
         await CallRunPodHandlerAsync(payload, useSync: false, cancel);
     }
 
-    /// <summary>Signal worker to shutdown.</summary>
+    /// <summary>Signal worker to shutdown gracefully.</summary>
     public async Task ShutdownWorkerAsync(CancellationToken cancel = default)
     {
         try
         {
-            var payload = new
+            JObject payload = new JObject
             {
-                input = new
+                ["input"] = new JObject
                 {
-                    action = "shutdown"
+                    ["action"] = "shutdown"
                 }
             };
 
-            await CallRunPodHandlerAsync(payload, useSync: true, cancel);
+            JObject response = await CallRunPodHandlerAsync(payload, useSync: true, cancel);
+
+            if (response["success"]?.Value<bool>() == true)
+            {
+                Logs.Verbose("[RunPodApiClient] Shutdown signal acknowledged by worker");
+            }
         }
         catch (Exception ex)
         {
-            Logs.Verbose($"Shutdown signal failed (worker may have already scaled down): {ex.Message}");
+            Logs.Verbose($"[RunPodApiClient] Shutdown signal failed (worker may have already scaled down): {ex.Message}");
         }
     }
 
     /// <summary>Make direct API call to SwarmUI instance running on worker.</summary>
-    public async Task<JObject> CallSwarmUIAsync(string workerPublicUrl, string apiPath, JObject requestBody, CancellationToken cancel = default)
+    public async Task<JObject> CallSwarmUIAsync(string workerPublicUrl, string apiPath, JObject requestBody, int timeoutSeconds = 600, CancellationToken cancel = default)
     {
         if (string.IsNullOrEmpty(workerPublicUrl))
+        {
             throw new ArgumentException("Worker public URL is required", nameof(workerPublicUrl));
+        }
 
-        string url = $"{workerPublicUrl.TrimEnd('/')}/{apiPath.TrimStart('/')}"; 
+        string url = $"{workerPublicUrl.TrimEnd('/')}/{apiPath.TrimStart('/')}";
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, url)
+        using HttpClient client = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(timeoutSeconds)
+        };
+
+        using HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, url)
         {
             Content = new StringContent(requestBody.ToString(), Encoding.UTF8, "application/json")
         };
 
-        Logs.Verbose($"Calling SwarmUI at {url}");
+        Logs.Verbose($"[RunPodApiClient] Calling SwarmUI: POST {url}");
 
-        using HttpResponseMessage response = await _httpClient.SendAsync(request, cancel);
-        
+        using HttpResponseMessage response = await client.SendAsync(request, cancel);
+
         if (!response.IsSuccessStatusCode)
         {
             string error = await response.Content.ReadAsStringAsync(cancel);
@@ -165,22 +166,22 @@ public class RunPodApiClient
         return JObject.Parse(content);
     }
 
-    /// <summary>Call RunPod handler endpoint.</summary>
-    private async Task<JObject> CallRunPodHandlerAsync(object payload, bool useSync, CancellationToken cancel)
+    /// <summary>Call RunPod handler endpoint (sync or async).</summary>
+    public async Task<JObject> CallRunPodHandlerAsync(JObject payload, bool useSync, CancellationToken cancel)
     {
         string endpoint = useSync ? "runsync" : "run";
-        string url = $"https://api.runpod.ai/v2/{_endpointId}/{endpoint}";
+        string url = $"https://api.runpod.ai/v2/{EndpointId}/{endpoint}";
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, url)
+        using HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, url)
         {
-            Content = new StringContent(JObject.FromObject(payload).ToString(), Encoding.UTF8, "application/json")
+            Content = new StringContent(payload.ToString(), Encoding.UTF8, "application/json")
         };
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", ApiKey);
 
-        Logs.Verbose($"Calling RunPod handler: {endpoint}");
+        Logs.Verbose($"[RunPodApiClient] Calling RunPod handler: {endpoint}");
 
-        using HttpResponseMessage response = await _httpClient.SendAsync(request, cancel);
-        
+        using HttpResponseMessage response = await HttpClient.SendAsync(request, cancel);
+
         if (!response.IsSuccessStatusCode)
         {
             string error = await response.Content.ReadAsStringAsync(cancel);
@@ -190,8 +191,7 @@ public class RunPodApiClient
         string content = await response.Content.ReadAsStringAsync(cancel);
         JObject result = JObject.Parse(content);
 
-        // For sync calls, result is directly in the response
-        // For async calls, need to poll for result
+        // For async calls, poll for completion
         if (!useSync)
         {
             string jobId = result["id"]?.ToString();
@@ -205,28 +205,28 @@ public class RunPodApiClient
         return result["output"] as JObject ?? result;
     }
 
-    /// <summary>Poll job status for async calls.</summary>
-    private async Task<JObject> PollJobStatusAsync(string jobId, CancellationToken cancel)
+    /// <summary>Poll job status for async RunPod calls.</summary>
+    public async Task<JObject> PollJobStatusAsync(string jobId, CancellationToken cancel)
     {
-        string url = $"https://api.runpod.ai/v2/{_endpointId}/status/{jobId}";
+        string url = $"https://api.runpod.ai/v2/{EndpointId}/status/{jobId}";
         int maxAttempts = 300; // 5 minutes with 1s interval
-        
-        using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
+
+        using HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", ApiKey);
 
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
             cancel.ThrowIfCancellationRequested();
 
-            using HttpResponseMessage response = await _httpClient.SendAsync(request, cancel);
+            using HttpResponseMessage response = await HttpClient.SendAsync(request, cancel);
             string content = await response.Content.ReadAsStringAsync(cancel);
             JObject result = JObject.Parse(content);
 
             string status = result["status"]?.ToString();
-            
+
             if (status == "COMPLETED")
             {
-                return result["output"] as JObject ?? result;
+                return result;
             }
             else if (status == "FAILED")
             {
@@ -241,7 +241,7 @@ public class RunPodApiClient
     }
 }
 
-/// <summary>Worker information from wakeup call.</summary>
+/// <summary>Worker information returned from wakeup or ready check.</summary>
 public class WorkerInfo
 {
     public string PublicUrl { get; set; }
@@ -257,5 +257,6 @@ public class WorkerReadyResponse
     public string PublicUrl { get; set; }
     public string SessionId { get; set; }
     public string WorkerId { get; set; }
+    public string Version { get; set; }
     public string Error { get; set; }
 }
