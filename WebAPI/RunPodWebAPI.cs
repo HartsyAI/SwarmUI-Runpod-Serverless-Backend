@@ -1,13 +1,10 @@
-using FreneticUtilities.FreneticExtensions;
-using System.Linq;
 using Newtonsoft.Json.Linq;
 using SwarmUI.Accounts;
-using SwarmUI.Backends;
 using SwarmUI.Core;
 using SwarmUI.Utils;
 using SwarmUI.WebAPI;
 
-namespace Hartsy.Extensions.RunPodServerless;
+namespace Hartsy.Extensions.RunPodServerless.WebAPI;
 
 /// <summary>Web API routes for the RunPod Serverless backend extension.</summary>
 public static class RunPodWebAPI
@@ -15,12 +12,8 @@ public static class RunPodWebAPI
     /// <summary>Register all RunPod Web API routes.</summary>
     public static void Register()
     {
-        // POST /API/RunPod/RefreshModels - Trigger a manual model refresh
         API.RegisterAPICall(RefreshModels, true, RunPodPermissions.PermUseRunPod);
-
-        // GET /API/RunPod/GetStatus - Get current status of all RunPod backends
         API.RegisterAPICall(GetStatus, false, RunPodPermissions.PermUseRunPod);
-
         Logs.Verbose("[RunPodWebAPI] Registered API routes: RefreshModels, GetStatus");
     }
 
@@ -32,7 +25,6 @@ public static class RunPodWebAPI
             IEnumerable<RunPodServerlessBackend> backends = Program.Backends.RunningBackendsOfType<RunPodServerlessBackend>();
             int refreshed = 0;
             int failed = 0;
-
             if (!backends.Any())
             {
                 return new JObject
@@ -41,17 +33,14 @@ public static class RunPodWebAPI
                     ["error"] = "No RunPod backends are currently running"
                 };
             }
-
             foreach (RunPodServerlessBackend backend in backends)
             {
                 try
                 {
-                    Logs.Info($"[RunPodWebAPI] Refreshing models for backend #{backend.BackendData.ID} ({backend.Title})...");
+                    Logs.Debug($"[RunPodWebAPI] Refreshing models for backend #{backend.BackendData.ID} ({backend.Title})...");
                     await backend.RefreshModelsFromWorkerAsync(session);
-
                     int modelCount = backend.Models?.Values.Sum(list => list.Count) ?? 0;
-                    Logs.Info($"[RunPodWebAPI] Backend #{backend.BackendData.ID} now has {modelCount} models");
-
+                    Logs.Debug($"[RunPodWebAPI] Backend #{backend.BackendData.ID} now has {modelCount} models");
                     refreshed++;
                 }
                 catch (Exception ex)
@@ -60,7 +49,6 @@ public static class RunPodWebAPI
                     failed++;
                 }
             }
-
             return new JObject
             {
                 ["success"] = true,
@@ -86,12 +74,10 @@ public static class RunPodWebAPI
         try
         {
             IEnumerable<RunPodServerlessBackend> backends = Program.Backends.RunningBackendsOfType<RunPodServerlessBackend>();
-            JArray backendStatuses = new JArray();
-
+            JArray backendStatuses = [];
             foreach (RunPodServerlessBackend backend in backends)
             {
                 int modelCount = backend.Models?.Values.Sum(list => list.Count) ?? 0;
-
                 backendStatuses.Add(new JObject
                 {
                     ["id"] = backend.BackendData.ID,
@@ -103,7 +89,6 @@ public static class RunPodWebAPI
                     ["max_concurrent"] = backend.Config.MaxConcurrent
                 });
             }
-
             return new JObject
             {
                 ["success"] = true,
