@@ -1,3 +1,6 @@
+using System.Linq;
+using System.Collections.Generic;
+using FreneticUtilities.FreneticExtensions;
 using SwarmUI.Accounts;
 using SwarmUI.Core;
 using SwarmUI.Utils;
@@ -47,6 +50,32 @@ public class RunPodServerlessExtension : Extension
         catch (Exception ex)
         {
             Logs.Error($"Failed to register RunPod API key type: {ex.Message}");
+        }
+        // Register extra models provider so RunPod remote models appear in model listings (like SwarmSwarm backend)
+        try
+        {
+            if (!ModelsAPI.ExtraModelProviders.ContainsKey("runpod_serverless"))
+            {
+                ModelsAPI.ExtraModelProviders["runpod_serverless"] = (string subtype) =>
+                {
+                    RunPodServerlessBackend[] backs = [.. Program.Backends.RunningBackendsOfType<RunPodServerlessBackend>().Where(b => b.RemoteModels is not null)];
+                    IEnumerable<Dictionary<string, Newtonsoft.Json.Linq.JObject>> sets = backs.Select(b => b.RemoteModels.GetValueOrDefault(subtype)).Where(s => s is not null);
+                    if (!sets.Any())
+                    {
+                        return [];
+                    }
+                    return sets.Aggregate((a, b) => a.Union(b).PairsToDictionary(false));
+                };
+                Logs.Debug("Registered RunPod Serverless models provider for extra remote models.");
+            }
+            else
+            {
+                Logs.Verbose("RunPod Serverless models provider already registered.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logs.Error($"Failed to register RunPod extra models provider: {ex.Message}");
         }
         RunPodWebAPI.Register();
         Logs.Info("RunPod Serverless Backend extension loaded successfully.");

@@ -13,6 +13,7 @@ using SwarmUI.Utils;
 using System.Net;
 using System.Net.Http;
 using System.Runtime.CompilerServices;
+using System.Linq;
 
 namespace Hartsy.Extensions.RunPodServerless;
 
@@ -40,7 +41,7 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         public int PollIntervalMs = 2000;
 
         [ConfigComment("Max worker startup timeout (seconds)")]
-        public int StartupTimeoutSec = 120;
+        public int StartupTimeoutSec = 800;
 
         [ConfigComment("Generation timeout (seconds)")]
         public int GenerationTimeoutSec = 300;
@@ -71,104 +72,287 @@ public class RunPodServerlessBackend : AbstractT2IBackend
     {
         AddLoadStatus("Starting RunPod serverless backend...");
         Status = BackendStatus.LOADING;
-        if (Config.AutoRefresh)
+        CanLoadModels = false;
+        Session = Program.Sessions.CreateSession("internal", SessionHandler.LocalUserID);
+        try
         {
-            Session = Program.Sessions.CreateSession("internal", SessionHandler.LocalUserID);
             string apiKey = GetRunPodApiKey(Session);
-            if (apiKey is null)
+            if (string.IsNullOrWhiteSpace(apiKey))
             {
-                Logs.Warning("[RunPodServerless] AutoRefresh enabled but no backend API key configured. Skipping auto refresh.");
-                Logs.Warning("[RunPodServerless] Set RunPodApiKey in backend settings or disable AutoRefresh.");
-                Status = BackendStatus.LOADING;
-                AddLoadStatus("No API key configured.");
+                throw new Exception("No RunPod API key configured. Add a RunPod API key in User Settings → API Keys.");
             }
-            else
-            {
-                try
-                {
-                    AddLoadStatus("Refreshing models from worker...");
-                    await RefreshModelsFromWorkerAsync(Session);
-                    Status = BackendStatus.RUNNING;
-                    AddLoadStatus("RunPod serverless backend ready.");
-                    Logs.Info($"[RunPodServerless] Auto refresh complete. Loaded {Models?.Values.Sum(list => list.Count) ?? 0} models.");
-                }
-                catch (Exception ex)
-                {
-                    Status = BackendStatus.ERRORED;
-                    AddLoadStatus("Auto refresh failed: " + ex.Message);
-                    Logs.Warning($"[RunPodServerless] Auto refresh failed: {ex.Message}");
-                }
-            }
+            AddLoadStatus("Refreshing models from worker (with retries)...");
+            await RefreshModelsFromWorkerAsync(Session);
+            Status = BackendStatus.RUNNING;
+            AddLoadStatus("RunPod serverless backend ready.");
+            Logs.Info($"[RunPodServerless] Model refresh complete. Loaded {Models?.Values.Sum(list => list.Count) ?? 0} models.");
+        }
+        catch (Exception ex)
+        {
+            Status = BackendStatus.ERRORED;
+            AddLoadStatus("Model refresh failed: " + ex.Message);
+            Logs.Error($"[RunPodServerless] Init failed: {ex.Message}");
+            throw;
         }
     }
 
-    /// <summary>Wake a worker, fetch its model list, and register models in SwarmUI.</summary>
+    /// <summary>Poll the worker's Swarm until all backends have finished loading.</summary>
+    public async Task WaitForWorkerBackendsLoadedAsync(RunPodApiClient client, WorkerInfo worker, int timeoutSec)
+    {
+        int pollMs = Math.Clamp(Config.PollIntervalMs, 500, 5000);
+        int attempts = Math.Max(1, (timeoutSec * 1000) / pollMs);
+        for (int i = 0; i < attempts; i++)
+        {
+            try
+            {
+                JObject list = await client.CallSwarmUIAsync(worker.PublicUrl, "/API/ListBackends", new JObject
+                {
+                    ["session_id"] = worker.SessionId,
+                    ["nonreal"] = true,
+                    ["full_data"] = true
+                }, timeoutSeconds: 30);
+                var statuses = list.Properties().Select(p => p.Value).OfType<JObject>().Select(b => (id: b["id"]?.ToString(), status: b["status"]?.ToString())).ToList();
+                bool anyLoading = statuses.Any(x => string.Equals(x.status, "loading", StringComparison.OrdinalIgnoreCase));
+                Logs.Debug($"[RunPodServerless] Worker backend statuses: {string.Join(", ", statuses.Select(s => $"{s.id}:{s.status}"))}");
+                if (!anyLoading)
+                {
+                    Logs.Debug("[RunPodServerless] Worker backends are loaded.");
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logs.Verbose($"[RunPodServerless] Error while checking worker backend status: {ex.Message}");
+            }
+            await Task.Delay(pollMs);
+        }
+        Logs.Verbose("[RunPodServerless] Timed out waiting for worker backends to finish loading; proceeding anyway.");
+    }
+
+    public override async Task<bool> LoadModel(T2IModel model, T2IParamInput input)
+    {
+        try
+        {
+            Session sess = input?.SourceSession ?? Session ?? Program.Sessions.CreateSession("internal", SessionHandler.LocalUserID);
+            string apiKey = GetRunPodApiKey(sess, input);
+            RunPodApiClient client = new(apiKey, Config.EndpointId);
+            int keepaliveDuration = Math.Max(120, Config.StartupTimeoutSec);
+            Logs.Debug($"[RunPodServerless] LoadModel requested: {(model?.Name ?? "<null>")}. Waking worker (keepalive {keepaliveDuration}s)...");
+            WorkerInfo worker = await WakeupAndWaitForWorkerAsync(client, keepaliveDuration);
+            Logs.Debug($"[RunPodServerless] Worker ready for LoadModel: {worker.WorkerId} at {worker.PublicUrl}");
+            await WaitForWorkerBackendsLoadedAsync(client, worker, Config.StartupTimeoutSec);
+            string desiredModel = null;
+            if (model is not null)
+            {
+                desiredModel = model.Name;
+            }
+            else if (input is not null)
+            {
+                object m = input.Get(T2IParamTypes.Model);
+                if (m is T2IModel tm) { desiredModel = tm.Name; }
+                else if (m is string ms) { desiredModel = ms; }
+            }
+            if (string.IsNullOrWhiteSpace(desiredModel))
+            {
+                Logs.Warning("[RunPodServerless] LoadModel called without a valid model name.");
+                return false;
+            }
+            Logs.Debug($"[RunPodServerless] Selecting model on worker: {desiredModel}");
+            JObject req = new()
+            {
+                ["session_id"] = worker.SessionId,
+                ["model"] = desiredModel
+            };
+            JObject resp = await client.CallSwarmUIAsync(worker.PublicUrl, "/API/SelectModel", req, timeoutSeconds: 120);
+            bool success = resp.TryGetValue("success", out JToken s) && s.Value<bool>();
+            if (!success)
+            {
+                Logs.Warning($"[RunPodServerless] SelectModel failed for '{desiredModel}', response: {resp.ToString(Newtonsoft.Json.Formatting.None)}");
+                // Fallback: toggle .safetensors suffix
+                string alt = desiredModel.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase)
+                    ? desiredModel[..^".safetensors".Length]
+                    : desiredModel + ".safetensors";
+                if (!string.Equals(alt, desiredModel, StringComparison.OrdinalIgnoreCase))
+                {
+                    Logs.Debug($"[RunPodServerless] Retrying SelectModel with alt name: {alt}");
+                    req["model"] = alt;
+                    resp = await client.CallSwarmUIAsync(worker.PublicUrl, "/API/SelectModel", req, timeoutSeconds: 120);
+                    success = resp.TryGetValue("success", out s) && s.Value<bool>();
+                    if (!success)
+                    {
+                        Logs.Warning($"[RunPodServerless] Alt SelectModel also failed for '{alt}', response: {resp.ToString(Newtonsoft.Json.Formatting.None)}");
+                    }
+                    else
+                    {
+                        desiredModel = alt;
+                    }
+                }
+            }
+            if (success)
+            {
+                CurrentModelName = desiredModel;
+                Logs.Debug($"[RunPodServerless] Model selected on worker successfully: {desiredModel}");
+            }
+            return success;
+        }
+        catch (Exception ex)
+        {
+            Logs.Verbose($"[RunPodServerless] LoadModel failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>Wake a worker, robustly fetch its model list with retries, and register models in SwarmUI.</summary>
     public async Task RefreshModelsFromWorkerAsync(Session session = null)
     {
         string apiKey = GetRunPodApiKey(session);
         RunPodApiClient client = new(apiKey, Config.EndpointId);
-        int keepaliveDuration = 300;
+        // Keep the worker alive for at least our retry window.
+        int retryIntervalMs = 10_000; // 10 seconds between attempts
+        int maxWaitSec = Math.Max(Config.StartupTimeoutSec, 120);
+        int keepaliveDuration = maxWaitSec + 60; // buffer above max wait
         Logs.Debug($"[RunPodServerless] Starting worker for model refresh (keepalive: {keepaliveDuration}s)...");
         WorkerInfo worker = await WakeupAndWaitForWorkerAsync(client, keepaliveDuration);
         Logs.Debug($"[RunPodServerless] Worker ready: {worker.WorkerId} at {worker.PublicUrl}");
-        RemoteModels ??= new ConcurrentDictionary<string, Dictionary<string, JObject>>();
-        Models ??= new ConcurrentDictionary<string, List<string>>();
-        List<Task> fetches = [];
-        foreach (string subtype in Program.T2IModelSets.Keys)
+
+        DateTime start = DateTime.UtcNow;
+        Exception lastError = null;
+        try
         {
-            fetches.Add(Task.Run(async () =>
+            while (true)
             {
                 try
                 {
-                    Logs.Debug($"[RunPodServerless] Listing models for subtype '{subtype}'");
-                    JObject request = new()
+                    // temp holders to only commit once we have a non-empty set
+                    var tempModels = new ConcurrentDictionary<string, List<string>>();
+                    var tempRemoteModels = new ConcurrentDictionary<string, Dictionary<string, JObject>>();
+
+                    List<Task> fetches = [];
+                    foreach (string subtype in Program.T2IModelSets.Keys)
                     {
-                        ["session_id"] = worker.SessionId,
-                        ["path"] = "",
-                        ["depth"] = 999,
-                        ["subtype"] = subtype,
-                        ["allowRemote"] = false,
-                        ["sortBy"] = "Name",
-                        ["sortReverse"] = false
-                    };
-                    JObject response = await client.CallSwarmUIAsync(worker.PublicUrl, "/API/ListModels", request);
-                    JArray filesArray = response["files"] as JArray;
-                    if (filesArray == null || filesArray.Count == 0)
+                        string subtypeLocal = subtype;
+                        fetches.Add(Task.Run(async () =>
+                        {
+                            try
+                            {
+                                Logs.Debug($"[RunPodServerless] Listing models for subtype '{subtypeLocal}'");
+                                JObject request = new()
+                                {
+                                    ["session_id"] = worker.SessionId,
+                                    ["path"] = "",
+                                    ["depth"] = 999,
+                                    ["subtype"] = subtypeLocal,
+                                    ["allowRemote"] = false,
+                                    ["sortBy"] = "Name",
+                                    ["sortReverse"] = false,
+                                    ["dataImages"] = true
+                                };
+                                JObject response = await client.CallSwarmUIAsync(worker.PublicUrl, "/API/ListModels", request);
+                                JArray filesArray = response["files"] as JArray;
+                                if (filesArray == null || filesArray.Count == 0)
+                                {
+                                    Logs.Verbose($"[RunPodServerless] No models found for subtype '{subtypeLocal}' in this attempt");
+                                    tempModels[subtypeLocal] = new List<string>();
+                                    tempRemoteModels[subtypeLocal] = new Dictionary<string, JObject>();
+                                    return;
+                                }
+                                List<string> modelNames = [];
+                                Dictionary<string, JObject> modelMetadata = [];
+                                foreach (JToken fileToken in filesArray)
+                                {
+                                    if (fileToken is JObject fileObj)
+                                    {
+                                        string modelName = fileObj["name"]?.ToString();
+                                        if (!string.IsNullOrWhiteSpace(modelName))
+                                        {
+                                            modelNames.Add(modelName);
+                                            JObject data = (JObject)fileObj.DeepClone();
+                                            data["local"] = false;
+                                            data["subtype"] = subtypeLocal;
+                                            modelMetadata[modelName] = data;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        string modelName = fileToken.ToString();
+                                        if (!string.IsNullOrWhiteSpace(modelName))
+                                        {
+                                            modelNames.Add(modelName);
+                                            modelMetadata[modelName] = new JObject
+                                            {
+                                                ["name"] = modelName,
+                                                ["local"] = false,
+                                                ["subtype"] = subtypeLocal
+                                            };
+                                        }
+                                    }
+                                }
+                                tempModels[subtypeLocal] = modelNames;
+                                tempRemoteModels[subtypeLocal] = modelMetadata;
+                                Logs.Debug($"[RunPodServerless] Found {modelNames.Count} models for subtype '{subtypeLocal}'");
+                            }
+                            catch (Exception ex)
+                            {
+                                Logs.Verbose($"[RunPodServerless] ListModels failed for subtype '{subtypeLocal}': {ex.Message}");
+                                tempModels[subtypeLocal] = new List<string>();
+                                tempRemoteModels[subtypeLocal] = new Dictionary<string, JObject>();
+                            }
+                        }));
+                    }
+
+                    await Task.WhenAll(fetches);
+                    int total = tempModels.Values.Sum(list => list.Count);
+                    if (total > 0)
                     {
-                        Logs.Verbose($"[RunPodServerless] No models found for subtype '{subtype}'");
+                        RemoteModels ??= new ConcurrentDictionary<string, Dictionary<string, JObject>>();
+                        Models ??= new ConcurrentDictionary<string, List<string>>();
+                        foreach (var kv in tempModels)
+                        {
+                            Models[kv.Key] = kv.Value;
+                        }
+                        foreach (var kv in tempRemoteModels)
+                        {
+                            RemoteModels[kv.Key] = kv.Value;
+                        }
+                        Logs.Debug($"[RunPodServerless] Model refresh complete: {total} models across {tempModels.Count} subtypes");
                         return;
                     }
-                    List<string> modelNames = [];
-                    Dictionary<string, JObject> modelMetadata = [];
-                    foreach (JToken fileToken in filesArray)
+
+                    // No models yet; check timeout and retry after 10 seconds
+                    if ((DateTime.UtcNow - start).TotalSeconds >= maxWaitSec)
                     {
-                        string modelName = fileToken.ToString();
-                        if (!string.IsNullOrWhiteSpace(modelName))
-                        {
-                            modelNames.Add(modelName);
-                            modelMetadata[modelName] = new JObject
-                            {
-                                ["name"] = modelName,
-                                ["local"] = false,
-                                ["subtype"] = subtype
-                            };
-                        }
+                        throw new TimeoutException($"No models discovered within {maxWaitSec} seconds.");
                     }
-                    Models[subtype] = modelNames;
-                    RemoteModels[subtype] = modelMetadata;
-                    Logs.Debug($"[RunPodServerless] Registered {modelNames.Count} models for subtype '{subtype}'");
+                    AddLoadStatus("Waiting for Swarm to finish loading models on worker...");
+                    await Task.Delay(retryIntervalMs);
+                    // Optionally extend keepalive during long waits
+                    _ = client.KeepAliveAsync(keepaliveDuration, 30);
                 }
                 catch (Exception ex)
                 {
-                    Logs.Error($"[RunPodServerless] Failed to load models for subtype '{subtype}': {ex.Message}");
+                    lastError = ex;
+                    if ((DateTime.UtcNow - start).TotalSeconds >= maxWaitSec)
+                    {
+                        throw;
+                    }
+                    Logs.Verbose($"[RunPodServerless] Model refresh attempt failed: {ex.Message}. Retrying in 10s...");
+                    await Task.Delay(retryIntervalMs);
+                    _ = client.KeepAliveAsync(keepaliveDuration, 30);
                 }
-            }));
+            }
         }
-        await Task.WhenAll(fetches);
-        int totalModels = Models.Values.Sum(list => list.Count);
-        Logs.Debug($"[RunPodServerless] Model refresh complete: {totalModels} models across {Models.Count} subtypes");
-        await client.ShutdownWorkerAsync();
-        Logs.Debug("[RunPodServerless] Worker shutdown signal sent");
+        finally
+        {
+            try
+            {
+                await client.ShutdownWorkerAsync();
+                Logs.Debug("[RunPodServerless] Worker shutdown signal sent");
+            }
+            catch (Exception ex)
+            {
+                Logs.Verbose($"[RunPodServerless] Worker shutdown ignored: {ex.Message}");
+            }
+        }
     }
 
     public override async Task Shutdown()
@@ -197,6 +381,45 @@ public class RunPodServerlessBackend : AbstractT2IBackend
             Logs.Debug($"[RunPodServerless] Waking up worker (keepalive: {keepaliveDuration}s)...");
             workerInfo = await WakeupAndWaitForWorkerAsync(client, keepaliveDuration);
             Logs.Debug($"[RunPodServerless] Worker ready: {workerInfo.WorkerId} at {workerInfo.PublicUrl}");
+            await WaitForWorkerBackendsLoadedAsync(client, workerInfo, Config.StartupTimeoutSec);
+            // Ensure the model requested in this generation is selected on the worker
+            string genModel = null;
+            object mobj = user_input.Get(T2IParamTypes.Model);
+            if (mobj is T2IModel tmm) { genModel = tmm.Name; }
+            else if (mobj is string ms) { genModel = ms; }
+            if (!string.IsNullOrWhiteSpace(genModel))
+            {
+                Logs.Debug($"[RunPodServerless] Ensuring model selected on worker before generation: {genModel}");
+                JObject selReq = new()
+                {
+                    ["session_id"] = workerInfo.SessionId,
+                    ["model"] = genModel
+                };
+                JObject selResp = await client.CallSwarmUIAsync(workerInfo.PublicUrl, "/API/SelectModel", selReq, timeoutSeconds: 120);
+                bool selOk = selResp.TryGetValue("success", out JToken sr) && sr.Value<bool>();
+                if (!selOk)
+                {
+                    // Retry with alternate name if needed
+                    string alt = genModel.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase)
+                        ? genModel[..^".safetensors".Length]
+                        : genModel + ".safetensors";
+                    if (!string.Equals(alt, genModel, StringComparison.OrdinalIgnoreCase))
+                    {
+                        Logs.Debug($"[RunPodServerless] Retry SelectModel with alt: {alt}");
+                        selReq["model"] = alt;
+                        selResp = await client.CallSwarmUIAsync(workerInfo.PublicUrl, "/API/SelectModel", selReq, timeoutSeconds: 120);
+                        selOk = selResp.TryGetValue("success", out sr) && sr.Value<bool>();
+                        if (!selOk)
+                        {
+                            Logs.Warning($"[RunPodServerless] Failed to select model '{genModel}' (and alt '{alt}') before generation. Proceeding anyway.");
+                        }
+                        else
+                        {
+                            genModel = alt;
+                        }
+                    }
+                }
+            }
             JObject swarmRequest = BuildGenerationRequest(user_input, workerInfo.SessionId);
             Logs.Debug("[RunPodServerless] Sending generation request to worker...");
             JObject swarmResponse = await client.CallSwarmUIAsync(workerInfo.PublicUrl, "/API/GenerateText2Image", swarmRequest,

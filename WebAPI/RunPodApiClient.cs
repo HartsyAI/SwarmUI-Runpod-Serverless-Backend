@@ -174,11 +174,11 @@ public class RunPodApiClient(string apiKey, string endpointId)
     {
         string url = $"https://api.runpod.ai/v2/{endpointId}/status/{jobId}";
         int maxAttempts = 300;
-        using HttpRequestMessage request = new(HttpMethod.Get, url);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
             cancel.ThrowIfCancellationRequested();
+            using HttpRequestMessage request = new(HttpMethod.Get, url);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
             using HttpResponseMessage response = await HttpClient.SendAsync(request, cancel);
             string content = await response.Content.ReadAsStringAsync(cancel);
             JObject result = JObject.Parse(content);
