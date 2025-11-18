@@ -71,29 +71,34 @@ public class RunPodServerlessBackend : AbstractT2IBackend
     public override async Task Init()
     {
         AddLoadStatus("Starting RunPod serverless backend...");
-        Status = BackendStatus.LOADING;
-        CanLoadModels = false;
+        // Mark backend as RUNNING immediately so the handler can select it and call LoadModel to wake workers on-demand.
+        Status = BackendStatus.RUNNING;
+        // Mark as able to load models so BackendHandler will select this backend
+        // and allow LoadModel() to wake the worker and select the requested model.
+        CanLoadModels = true;
         Session = Program.Sessions.CreateSession("internal", SessionHandler.LocalUserID);
-        try
+        // Try to refresh model listings in the background, but do not block init.
+        _ = Utilities.RunCheckedTask(async () =>
         {
-            string apiKey = GetRunPodApiKey(Session);
-            if (string.IsNullOrWhiteSpace(apiKey))
+            try
             {
-                throw new Exception("No RunPod API key configured. Add a RunPod API key in User Settings → API Keys.");
+                string apiKey = GetRunPodApiKey(Session);
+                if (string.IsNullOrWhiteSpace(apiKey))
+                {
+                    AddLoadStatus("No RunPod API key configured. Skipping initial model refresh.");
+                    return;
+                }
+                AddLoadStatus("Refreshing models from worker (background)...");
+                await RefreshModelsFromWorkerAsync(Session);
+                AddLoadStatus("RunPod serverless backend ready.");
+                Logs.Info($"[RunPodServerless] Model refresh complete. Loaded {Models?.Values.Sum(list => list.Count) ?? 0} models.");
             }
-            AddLoadStatus("Refreshing models from worker (with retries)...");
-            await RefreshModelsFromWorkerAsync(Session);
-            Status = BackendStatus.RUNNING;
-            AddLoadStatus("RunPod serverless backend ready.");
-            Logs.Info($"[RunPodServerless] Model refresh complete. Loaded {Models?.Values.Sum(list => list.Count) ?? 0} models.");
-        }
-        catch (Exception ex)
-        {
-            Status = BackendStatus.ERRORED;
-            AddLoadStatus("Model refresh failed: " + ex.Message);
-            Logs.Error($"[RunPodServerless] Init failed: {ex.Message}");
-            throw;
-        }
+            catch (Exception ex)
+            {
+                AddLoadStatus("Model refresh failed (background): " + ex.Message);
+                Logs.Verbose($"[RunPodServerless] Background model refresh failed: {ex.Message}");
+            }
+        });
     }
 
     /// <summary>Poll the worker's Swarm until all backends have finished loading.</summary>
@@ -158,42 +163,93 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                 return false;
             }
             Logs.Debug($"[RunPodServerless] Selecting model on worker: {desiredModel}");
-            JObject req = new()
+            async Task<bool> trySelect(string name)
             {
-                ["session_id"] = worker.SessionId,
-                ["model"] = desiredModel
-            };
-            JObject resp = await client.CallSwarmUIAsync(worker.PublicUrl, "/API/SelectModel", req, timeoutSeconds: 120);
-            bool success = resp.TryGetValue("success", out JToken s) && s.Value<bool>();
-            if (!success)
-            {
-                Logs.Warning($"[RunPodServerless] SelectModel failed for '{desiredModel}', response: {resp.ToString(Newtonsoft.Json.Formatting.None)}");
-                // Fallback: toggle .safetensors suffix
-                string alt = desiredModel.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase)
-                    ? desiredModel[..^".safetensors".Length]
-                    : desiredModel + ".safetensors";
-                if (!string.Equals(alt, desiredModel, StringComparison.OrdinalIgnoreCase))
+                JObject req = new()
                 {
-                    Logs.Debug($"[RunPodServerless] Retrying SelectModel with alt name: {alt}");
-                    req["model"] = alt;
-                    resp = await client.CallSwarmUIAsync(worker.PublicUrl, "/API/SelectModel", req, timeoutSeconds: 120);
-                    success = resp.TryGetValue("success", out s) && s.Value<bool>();
-                    if (!success)
-                    {
-                        Logs.Warning($"[RunPodServerless] Alt SelectModel also failed for '{alt}', response: {resp.ToString(Newtonsoft.Json.Formatting.None)}");
-                    }
-                    else
-                    {
-                        desiredModel = alt;
-                    }
+                    ["session_id"] = worker.SessionId,
+                    ["model"] = name
+                };
+                JObject resp = await client.CallSwarmUIAsync(worker.PublicUrl, "/API/SelectModel", req, timeoutSeconds: 120);
+                bool ok = resp.TryGetValue("success", out JToken s) && s.Value<bool>();
+                if (!ok)
+                {
+                    Logs.Verbose($"[RunPodServerless] SelectModel failed for '{name}', response: {resp.ToString(Formatting.None)}");
+                }
+                return ok;
+            }
+            static string ToggleSafetensors(string name)
+            {
+                return name.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase)
+                    ? name[..^".safetensors".Length]
+                    : name + ".safetensors";
+            }
+            string basename = desiredModel?.Contains('/') == true ? desiredModel[(desiredModel.LastIndexOf('/') + 1)..] : desiredModel;
+            // Try a set of reasonable candidates
+            string[] candidates = new[]
+            {
+                desiredModel,
+                ToggleSafetensors(desiredModel ?? ""),
+                basename,
+                ToggleSafetensors(basename ?? "")
+            }.Where(s => !string.IsNullOrWhiteSpace(s)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            Logs.Verbose($"[RunPodServerless] SelectModel candidates: {string.Join(", ", candidates)}");
+            foreach (string cand in candidates)
+            {
+                if (await trySelect(cand))
+                {
+                    desiredModel = cand;
+                    CurrentModelName = desiredModel;
+                    Logs.Debug($"[RunPodServerless] Model selected on worker successfully: {desiredModel}");
+                    return true;
                 }
             }
-            if (success)
+            // Fallback: query worker model list and best-match
+            try
             {
-                CurrentModelName = desiredModel;
-                Logs.Debug($"[RunPodServerless] Model selected on worker successfully: {desiredModel}");
+                JObject listReq = new()
+                {
+                    ["session_id"] = worker.SessionId,
+                    ["path"] = "",
+                    ["depth"] = 999,
+                    ["subtype"] = "Stable-Diffusion",
+                    ["allowRemote"] = false,
+                    ["sortBy"] = "Name",
+                    ["sortReverse"] = false,
+                    ["dataImages"] = false
+                };
+                JObject listResp = await client.CallSwarmUIAsync(worker.PublicUrl, "/API/ListModels", listReq, timeoutSeconds: 60);
+                var files = (listResp["files"] as JArray)?.Select(t => t.Type == JTokenType.Object ? t["name"]?.ToString() ?? t.ToString() : t.ToString()).Where(n => !string.IsNullOrWhiteSpace(n)).ToList() ?? new List<string>();
+                Logs.Verbose($"[RunPodServerless] Worker has {files.Count} models for subtype 'Stable-Diffusion': {string.Join(", ", files)}");
+                string dl = desiredModel ?? "";
+                string dlBase = basename ?? dl;
+                // prefer exact case-insensitive, then endswith, then contains
+                string best = files.FirstOrDefault(n => n.Equals(dl, StringComparison.OrdinalIgnoreCase))
+                    ?? files.FirstOrDefault(n => n.Equals(dlBase, StringComparison.OrdinalIgnoreCase))
+                    ?? files.FirstOrDefault(n => n.EndsWith(dlBase, StringComparison.OrdinalIgnoreCase))
+                    ?? files.FirstOrDefault(n => n.Contains(dlBase, StringComparison.OrdinalIgnoreCase));
+                if (!string.IsNullOrWhiteSpace(best))
+                {
+                    Logs.Debug($"[RunPodServerless] Retrying SelectModel with worker-listed name: {best}");
+                    if (await trySelect(best))
+                    {
+                        desiredModel = best;
+                        CurrentModelName = desiredModel;
+                        Logs.Debug($"[RunPodServerless] Model selected on worker successfully: {desiredModel}");
+                        return true;
+                    }
+                }
+                else
+                {
+                    Logs.Warning($"[RunPodServerless] Requested model '{desiredModel}' not found in worker list. Available models: {string.Join(", ", files)}");
+                }
             }
-            return success;
+            catch (Exception ex)
+            {
+                Logs.Verbose($"[RunPodServerless] Failed to query worker model list for fallback: {ex.Message}");
+            }
+            Logs.Warning($"[RunPodServerless] Unable to select model '{desiredModel}' on worker after all retries.");
+            return false;
         }
         catch (Exception ex)
         {
@@ -466,26 +522,93 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         {
             string paramId = entry.Key;
             object value = entry.Value;
-            if (value == null) continue;
-            if (value is JToken jtoken)
+            if (value is null)
             {
-                request[paramId] = jtoken;
+                continue;
             }
-            else if (value is string str)
+            // Resolve param type to serialize appropriately for API rawInput
+            T2IParamType type = T2IParamTypes.GetType(paramId, input);
+            try
             {
-                request[paramId] = str;
+                switch (type?.Type)
+                {
+                    case T2IParamDataType.MODEL:
+                        // Send the model name string
+                        if (value is T2IModel tm)
+                        {
+                            request[paramId] = tm.Name;
+                        }
+                        else
+                        {
+                            request[paramId] = value.ToString();
+                        }
+                        break;
+                    case T2IParamDataType.INTEGER:
+                    case T2IParamDataType.DECIMAL:
+                        request[paramId] = value.ToString();
+                        break;
+                    case T2IParamDataType.BOOLEAN:
+                        request[paramId] = ((bool)value) ? "true" : "false";
+                        break;
+                    case T2IParamDataType.TEXT:
+                    case T2IParamDataType.DROPDOWN:
+                        request[paramId] = value.ToString();
+                        break;
+                    case T2IParamDataType.LIST:
+                        if (value is IEnumerable<string> sList)
+                        {
+                            request[paramId] = string.Join(",", sList);
+                        }
+                        else if (value is System.Collections.IEnumerable anyList)
+                        {
+                            List<string> parts = new();
+                            foreach (object obj in anyList)
+                            {
+                                if (obj is null) continue;
+                                parts.Add(obj.ToString());
+                            }
+                            request[paramId] = string.Join(",", parts);
+                        }
+                        else
+                        {
+                            request[paramId] = value.ToString();
+                        }
+                        break;
+                    case T2IParamDataType.IMAGE:
+                        // Expect image as data-string; if it's an Image, convert
+                        if (value is Image img)
+                        {
+                            request[paramId] = img.AsDataString();
+                        }
+                        else
+                        {
+                            request[paramId] = value.ToString();
+                        }
+                        break;
+                    case T2IParamDataType.IMAGE_LIST:
+                        if (value is IEnumerable<Image> imgs)
+                        {
+                            request[paramId] = string.Join("|", imgs.Select(i => i.AsDataString()));
+                        }
+                        else
+                        {
+                            request[paramId] = value.ToString();
+                        }
+                        break;
+                    case T2IParamDataType.AUDIO:
+                    case T2IParamDataType.VIDEO:
+                        request[paramId] = value.ToString();
+                        break;
+                    default:
+                        // Fallback to string
+                        request[paramId] = value.ToString();
+                        break;
+                }
             }
-            else if (value is int || value is long || value is double || value is bool)
+            catch
             {
-                request[paramId] = JToken.FromObject(value);
-            }
-            else if (value is System.Collections.IEnumerable enumerable && value is not string)
-            {
-                request[paramId] = JArray.FromObject(enumerable);
-            }
-            else
-            {
-                request[paramId] = JToken.FromObject(value);
+                // Last-ditch fallback to avoid serialization explosions
+                request[paramId] = value.ToString();
             }
         }
         return request;

@@ -7,6 +7,7 @@ using SwarmUI.Utils;
 using SwarmUI.WebAPI;
 using Microsoft.AspNetCore.Html;
 using Hartsy.Extensions.RunPodServerless.WebAPI;
+using SwarmUI.Text2Image;
 
 namespace Hartsy.Extensions.RunPodServerless;
 
@@ -76,6 +77,48 @@ public class RunPodServerlessExtension : Extension
         catch (Exception ex)
         {
             Logs.Error($"Failed to register RunPod extra models provider: {ex.Message}");
+        }
+        // Prefer RunPod only when the requested model is available on a RunPod worker
+        try
+        {
+            T2IEngine.PreGenerateEvent += (p) =>
+            {
+                string currentType = p.UserInput.Get(T2IParamTypes.BackendType, "Any");
+                if (!string.IsNullOrEmpty(currentType) && !currentType.Equals("Any", StringComparison.OrdinalIgnoreCase))
+                {
+                    return; // Respect explicit backend type
+                }
+                // Determine requested model name
+                string requestedModel = null;
+                object m = p.UserInput.Get(T2IParamTypes.Model);
+                if (m is T2IModel tm) { requestedModel = tm.Name; }
+                else if (m is string ms) { requestedModel = ms; }
+                if (string.IsNullOrWhiteSpace(requestedModel))
+                {
+                    return;
+                }
+                // Check if any RunPod backend reports this model (in any subtype) via RemoteModels
+                foreach (var b in Program.Backends.RunningBackendsOfType<RunPodServerlessBackend>())
+                {
+                    var rem = b.RemoteModels;
+                    if (rem is null) { continue; }
+                    bool found = rem.Values.Any(dict => dict.ContainsKey(requestedModel)
+                        || dict.ContainsKey(requestedModel.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase) ? requestedModel[..^".safetensors".Length] : requestedModel)
+                        || dict.Keys.Any(k => k.Equals(requestedModel.AfterLast('/'), StringComparison.OrdinalIgnoreCase))
+                        || dict.Keys.Any(k => k.Equals((requestedModel.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase) ? requestedModel[..^".safetensors".Length] : requestedModel).AfterLast('/'), StringComparison.OrdinalIgnoreCase)));
+                    if (found)
+                    {
+                        p.UserInput.Set(T2IParamTypes.BackendType, "runpod_serverless");
+                        return;
+                    }
+                }
+                // Otherwise: leave BackendType as Any so other backends can match
+            };
+            Logs.Debug("Registered PreGenerateEvent to default Backend Type to RunPod only when the requested model is available on RunPod.");
+        }
+        catch (Exception ex)
+        {
+            Logs.Error($"Failed to register scoped PreGenerateEvent handler for BackendType defaulting: {ex.Message}");
         }
         RunPodWebAPI.Register();
         Logs.Info("RunPod Serverless Backend extension loaded successfully.");
