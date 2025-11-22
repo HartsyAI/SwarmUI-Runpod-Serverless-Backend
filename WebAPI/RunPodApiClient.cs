@@ -136,7 +136,10 @@ public class RunPodApiClient(string apiKey, string endpointId)
             throw new HttpRequestException($"SwarmUI API call failed ({response.StatusCode}): {error}");
         }
         string content = await response.Content.ReadAsStringAsync(cancel);
-        return JObject.Parse(content);
+        JObject result = JObject.Parse(content);
+        // Check for session errors and throw if found
+        RunPodServerlessBackend.AutoThrowException(result);
+        return result;
     }
 
     /// <summary>Call RunPod handler endpoint (sync or async).</summary>
