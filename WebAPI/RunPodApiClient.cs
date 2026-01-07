@@ -14,10 +14,11 @@ public class RunPodApiClient(string apiKey, string endpointId)
     /// <summary>Shared HTTP client using SwarmUI's infrastructure.</summary>
     public HttpClient HttpClient = NetworkBackendUtils.MakeHttpClient();
 
-    /// <summary>Wake up worker with keepalive. Returns immediately after initiating wakeup.</summary>
+    /// <summary>Wake up worker with keepalive. Submits async job and returns job ID immediately.</summary>
     /// <param name="keepaliveDuration">How long to keep worker alive in seconds (default: 3600)</param>
     /// <param name="keepaliveInterval">Ping interval in seconds (default: 30)</param>
-    public async Task WakeupWorkerAsync(int keepaliveDuration = 3600, int keepaliveInterval = 30, CancellationToken cancel = default)
+    /// <returns>Job ID for tracking the wakeup request</returns>
+    public async Task<string> WakeupWorkerAsync(int keepaliveDuration = 3600, int keepaliveInterval = 30, CancellationToken cancel = default)
     {
         JObject payload = new()
         {
@@ -29,7 +30,41 @@ public class RunPodApiClient(string apiKey, string endpointId)
             }
         };
         Logs.Verbose($"[RunPodApiClient] Sending wakeup signal (duration: {keepaliveDuration}s, interval: {keepaliveInterval}s)");
-        await CallRunPodHandlerAsync(payload, useSync: false, cancel);
+        string jobId = await SubmitJobAsync(payload, cancel);
+        Logs.Verbose($"[RunPodApiClient] Wakeup job submitted: {jobId}");
+        return jobId;
+    }
+
+    /// <summary>Submit a job to RunPod async endpoint, returns job ID immediately without waiting.</summary>
+    public async Task<string> SubmitJobAsync(JObject payload, CancellationToken cancel = default)
+    {
+        string url = $"https://api.runpod.ai/v2/{endpointId}/run";
+        using HttpRequestMessage request = new(HttpMethod.Post, url)
+        {
+            Content = new StringContent(payload.ToString(), Encoding.UTF8, "application/json")
+        };
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        Logs.Verbose($"[RunPodApiClient] Submitting async job to RunPod");
+        using HttpResponseMessage response = await HttpClient.SendAsync(request, cancel);
+        if (!response.IsSuccessStatusCode)
+        {
+            string error = await response.Content.ReadAsStringAsync(cancel);
+            throw new HttpRequestException($"RunPod API call failed ({response.StatusCode}): {error}");
+        }
+        string content = await response.Content.ReadAsStringAsync(cancel);
+        JObject result = JObject.Parse(content);
+        return result["id"]?.ToString() ?? throw new Exception("No job ID in RunPod response");
+    }
+
+    /// <summary>Get the current status of a job. Returns the full status response.</summary>
+    public async Task<JObject> GetJobStatusAsync(string jobId, CancellationToken cancel = default)
+    {
+        string url = $"https://api.runpod.ai/v2/{endpointId}/status/{jobId}";
+        using HttpRequestMessage request = new(HttpMethod.Get, url);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        using HttpResponseMessage response = await HttpClient.SendAsync(request, cancel);
+        string content = await response.Content.ReadAsStringAsync(cancel);
+        return JObject.Parse(content);
     }
 
     /// <summary>Check if worker is ready for generation.</summary>
@@ -172,11 +207,13 @@ public class RunPodApiClient(string apiKey, string endpointId)
         return result["output"] as JObject ?? result;
     }
 
-    /// <summary>Poll job status for async RunPod calls.</summary>
+    /// <summary>Poll job status for async RunPod calls. Extracts worker info when IN_PROGRESS.</summary>
     public async Task<JObject> PollJobStatusAsync(string jobId, CancellationToken cancel)
     {
         string url = $"https://api.runpod.ai/v2/{endpointId}/status/{jobId}";
         int maxAttempts = 300;
+        string lastWorkerId = null;
+        
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
             cancel.ThrowIfCancellationRequested();
@@ -186,9 +223,26 @@ public class RunPodApiClient(string apiKey, string endpointId)
             string content = await response.Content.ReadAsStringAsync(cancel);
             JObject result = JObject.Parse(content);
             string status = result["status"]?.ToString();
+            string workerId = result["workerId"]?.ToString();
+            
+            if (!string.IsNullOrEmpty(workerId) && workerId != lastWorkerId)
+            {
+                lastWorkerId = workerId;
+                Logs.Verbose($"[RunPodApiClient] Job {jobId} assigned to worker: {workerId}");
+            }
+            
             if (status == "COMPLETED")
             {
+                // Ensure workerId is in the result for caller to use
+                if (!string.IsNullOrEmpty(lastWorkerId) && result["workerId"] == null)
+                {
+                    result["workerId"] = lastWorkerId;
+                }
                 return result;
+            }
+            else if (status == "IN_PROGRESS")
+            {
+                Logs.Verbose($"[RunPodApiClient] Job {jobId} in progress on worker {workerId}...");
             }
             else if (status == "FAILED")
             {

@@ -20,7 +20,10 @@ namespace Hartsy.Extensions.RunPodServerless;
 public class RunPodServerlessBackend : AbstractT2IBackend
 {
     /// <summary>Cache of remote models by subtype.</summary>
-    public ConcurrentDictionary<string, Dictionary<string, JObject>> RemoteModels = null;
+    public ConcurrentDictionary<string, Dictionary<string, JObject>> RemoteModels = new();
+
+    /// <summary>Model names by subtype (for internal tracking).</summary>
+    public new ConcurrentDictionary<string, List<string>> Models = new();
 
     public Session Session = null;
 
@@ -61,9 +64,18 @@ public class RunPodServerlessBackend : AbstractT2IBackend
 
         [ConfigComment("Attempt to refresh models from worker on backend init")]
         public bool AutoRefresh = false;
+
+        [ConfigComment("Worker SwarmUI port (default: 7801)")]
+        public int WorkerPort = 7801;
     }
 
     public Settings Config => (Settings)SettingsRaw;
+
+    /// <summary>Construct worker public URL from worker ID and port.</summary>
+    public string GetWorkerPublicUrl(string workerId)
+    {
+        return $"https://{workerId}-{Config.WorkerPort}.proxy.runpod.net";
+    }
 
     /// <summary>Auto-throw exception if response indicates session error.</summary>
     public static void AutoThrowException(JObject data)
@@ -394,8 +406,11 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                                             modelMetadata[modelName] = new JObject
                                             {
                                                 ["name"] = modelName,
+                                                ["title"] = modelName,
                                                 ["local"] = false,
-                                                ["subtype"] = subtypeLocal
+                                                ["subtype"] = subtypeLocal,
+                                                ["architecture"] = "stable-diffusion-v1",
+                                                ["is_supported_model_format"] = true
                                             };
                                         }
                                     }
@@ -417,8 +432,6 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                     int total = tempModels.Values.Sum(list => list.Count);
                     if (total > 0)
                     {
-                        RemoteModels ??= new ConcurrentDictionary<string, Dictionary<string, JObject>>();
-                        Models ??= new ConcurrentDictionary<string, List<string>>();
                         foreach (var kv in tempModels)
                         {
                             Models[kv.Key] = kv.Value;
@@ -428,6 +441,10 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                             RemoteModels[kv.Key] = kv.Value;
                         }
                         Logs.Debug($"[RunPodServerless] Model refresh complete: {total} models across {tempModels.Count} subtypes");
+                        foreach (var kv in RemoteModels)
+                        {
+                            Logs.Verbose($"[RunPodServerless] RemoteModels['{kv.Key}'] = {kv.Value.Count} models");
+                        }
                         return;
                     }
 
@@ -665,37 +682,72 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         }
     }
 
-    /// <summary>Wake up worker and poll until ready.</summary>
+    /// <summary>Wake up worker and poll until ready. Uses job status to get worker ID, then probes worker URL directly.</summary>
     public async Task<WorkerInfo> WakeupAndWaitForWorkerAsync(RunPodApiClient client, int keepaliveDuration)
     {
         int keepaliveInterval = 30;
         Logs.Verbose($"[RunPodServerless] Initiating wakeup with {keepaliveDuration}s keepalive...");
-        await client.WakeupWorkerAsync(keepaliveDuration, keepaliveInterval);
-        await Task.Delay(2000);
+        string jobId = await client.WakeupWorkerAsync(keepaliveDuration, keepaliveInterval);
         int maxWaitSeconds = Config.StartupTimeoutSec;
         int pollIntervalMs = Config.PollIntervalMs;
         int maxAttempts = (maxWaitSeconds * 1000) / pollIntervalMs;
-        Logs.Info($"[RunPodServerless] Polling for worker ready (max {maxWaitSeconds}s, interval {pollIntervalMs}ms)...");
+        string workerId = null;
+        string publicUrl = null;
+        
+        AddLoadStatus("Waiting for RunPod worker to start...");
+        
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
             try
             {
-                WorkerReadyResponse readyResponse = await client.CheckWorkerReadyAsync();
-                if (readyResponse.Ready)
+                if (string.IsNullOrEmpty(workerId))
                 {
-                    int elapsedSeconds = (attempt * pollIntervalMs) / 1000;
-                    Logs.Info($"[RunPodServerless] Worker ready after {elapsedSeconds}s");
-                    return new WorkerInfo
+                    JObject jobStatus = await client.GetJobStatusAsync(jobId);
+                    string status = jobStatus["status"]?.ToString();
+                    workerId = jobStatus["workerId"]?.ToString();
+                    
+                    Logs.Verbose($"[RunPodServerless] Job {jobId} status: {status}, workerId: {workerId ?? "(none)"}");
+                    
+                    if (status == "FAILED")
                     {
-                        PublicUrl = readyResponse.PublicUrl,
-                        SessionId = readyResponse.SessionId,
-                        WorkerId = readyResponse.WorkerId,
-                        Version = readyResponse.Version
-                    };
+                        string error = jobStatus["error"]?.ToString() ?? "Job failed";
+                        throw new Exception($"Wakeup job failed: {error}");
+                    }
+                    
+                    if (!string.IsNullOrEmpty(workerId))
+                    {
+                        publicUrl = GetWorkerPublicUrl(workerId);
+                        Logs.Info($"[RunPodServerless] Worker ID obtained: {workerId}, URL: {publicUrl}");
+                        AddLoadStatus($"Worker starting: {workerId}");
+                    }
                 }
-                if (!string.IsNullOrEmpty(readyResponse.Error))
+                
+                if (!string.IsNullOrEmpty(publicUrl))
                 {
-                    Logs.Verbose($"[RunPodServerless] Worker not ready: {readyResponse.Error}");
+                    try
+                    {
+                        JObject sessionReq = new() { ["local"] = true };
+                        JObject sessionResp = await client.CallSwarmUIAsync(publicUrl, "/API/GetNewSession", sessionReq, timeoutSeconds: 10);
+                        
+                        string sessionId = sessionResp["session_id"]?.ToString();
+                        if (!string.IsNullOrEmpty(sessionId))
+                        {
+                            int elapsedSeconds = (attempt * pollIntervalMs) / 1000;
+                            Logs.Info($"[RunPodServerless] Worker ready after {elapsedSeconds}s (session: {sessionId})");
+                            AddLoadStatus("Worker ready!");
+                            return new WorkerInfo
+                            {
+                                PublicUrl = publicUrl,
+                                SessionId = sessionId,
+                                WorkerId = workerId,
+                                Version = sessionResp["version"]?.ToString()
+                            };
+                        }
+                    }
+                    catch (Exception probeEx)
+                    {
+                        Logs.Verbose($"[RunPodServerless] Worker probe failed (still starting): {probeEx.Message}");
+                    }
                 }
             }
             catch (Exception ex)

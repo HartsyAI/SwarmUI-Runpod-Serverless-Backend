@@ -1,6 +1,7 @@
 using System.Linq;
 using System.Collections.Generic;
 using FreneticUtilities.FreneticExtensions;
+using Newtonsoft.Json.Linq;
 using SwarmUI.Accounts;
 using SwarmUI.Core;
 using SwarmUI.Utils;
@@ -25,6 +26,8 @@ public class RunPodServerlessExtension : Extension
     public override void OnPreInit()
     {
         Logs.Init("Initializing Hartsy's RunPod Serverless Backend Extension...");
+        // Register frontend script file for UI feature flags and parameter handling
+        ScriptFiles.Add("Assets/runpod-backend.js");
     }
 
     public override void OnInit()
@@ -59,13 +62,29 @@ public class RunPodServerlessExtension : Extension
             {
                 ModelsAPI.ExtraModelProviders["runpod_serverless"] = (string subtype) =>
                 {
-                    RunPodServerlessBackend[] backs = [.. Program.Backends.RunningBackendsOfType<RunPodServerlessBackend>().Where(b => b.RemoteModels is not null)];
-                    IEnumerable<Dictionary<string, Newtonsoft.Json.Linq.JObject>> sets = backs.Select(b => b.RemoteModels.GetValueOrDefault(subtype)).Where(s => s is not null);
-                    if (!sets.Any())
+                    Dictionary<string, JObject> result = new();
+                    var backends = Program.Backends.RunningBackendsOfType<RunPodServerlessBackend>().ToList();
+                    Logs.Verbose($"[RunPodServerless] ExtraModelProviders callback for subtype '{subtype}': found {backends.Count} running backend(s)");
+                    foreach (var backend in backends)
                     {
-                        return [];
+                        if (backend.RemoteModels != null && backend.RemoteModels.TryGetValue(subtype, out var models) && models != null)
+                        {
+                            Logs.Verbose($"[RunPodServerless] Backend has {models.Count} models for subtype '{subtype}'");
+                            foreach (var kvp in models)
+                            {
+                                if (!result.ContainsKey(kvp.Key))
+                                {
+                                    result[kvp.Key] = kvp.Value;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            Logs.Verbose($"[RunPodServerless] Backend has no models for subtype '{subtype}' (RemoteModels null: {backend.RemoteModels == null})");
+                        }
                     }
-                    return sets.Aggregate((a, b) => a.Union(b).PairsToDictionary(false));
+                    Logs.Verbose($"[RunPodServerless] Returning {result.Count} total models for subtype '{subtype}'");
+                    return result;
                 };
                 Logs.Debug("Registered RunPod Serverless models provider for extra remote models.");
             }
