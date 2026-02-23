@@ -82,7 +82,7 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         }
     }
 
-    /// <summary>Run an async task with automatic session refresh on invalidation.</summary>
+    /// <summary>Run an async task with automatic session refresh on invalidation. Recursively retries after re-creating the session.</summary>
     public async Task RunWithSession(Func<Task> run)
     {
         try
@@ -91,13 +91,14 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         }
         catch (SessionInvalidException)
         {
-            Logs.Verbose($"[RunPodServerless] Session invalid for backend {BackendData?.ID}, will refresh on next worker wakeup.");
-            // Session will be refreshed on next worker wakeup
-            throw;
+            Logs.Verbose($"[RunPodServerless] Session invalid for backend {BackendData?.ID}, recreating session and retrying...");
+            Session = Program.Sessions.CreateSession("internal", SessionHandler.LocalUserID);
+            await ClearWorkerStateAsync();
+            await RunWithSession(run);
         }
     }
 
-    /// <summary>Run an async task with automatic session refresh on invalidation (with return value).</summary>
+    /// <summary>Run an async task with automatic session refresh on invalidation (with return value). Recursively retries after re-creating the session.</summary>
     public async Task<T> RunWithSession<T>(Func<Task<T>> run)
     {
         try
@@ -106,9 +107,10 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         }
         catch (SessionInvalidException)
         {
-            Logs.Verbose($"[RunPodServerless] Session invalid for backend {BackendData?.ID}, will refresh on next worker wakeup.");
-            // Session will be refreshed on next worker wakeup
-            throw;
+            Logs.Verbose($"[RunPodServerless] Session invalid for backend {BackendData?.ID}, recreating session and retrying...");
+            Session = Program.Sessions.CreateSession("internal", SessionHandler.LocalUserID);
+            await ClearWorkerStateAsync();
+            return await RunWithSession(run);
         }
     }
 
@@ -220,6 +222,11 @@ public class RunPodServerlessBackend : AbstractT2IBackend
 
     public override async Task<bool> LoadModel(T2IModel model, T2IParamInput input)
     {
+        if (input is not null && input.Get(T2IParamTypes.NoLoadModels, false))
+        {
+            CurrentModelName = model?.Name;
+            return true;
+        }
         try
         {
             Session sess = input?.SourceSession ?? Session ?? Program.Sessions.CreateSession("internal", SessionHandler.LocalUserID);
@@ -499,8 +506,23 @@ public class RunPodServerlessBackend : AbstractT2IBackend
 
     public override async Task Shutdown()
     {
-        Status = BackendStatus.IDLE;
-        await Task.CompletedTask;
+        Logs.Info($"[RunPodServerless] Backend {BackendData?.ID} shutting down...");
+        if (CurrentWorker != null)
+        {
+            try
+            {
+                string apiKey = GetRunPodApiKey(Session);
+                RunPodApiClient client = new(apiKey, Config.EndpointId);
+                await client.ShutdownWorkerAsync();
+                Logs.Verbose("[RunPodServerless] Worker shutdown signal sent during backend shutdown.");
+            }
+            catch (Exception ex)
+            {
+                Logs.Verbose($"[RunPodServerless] Worker shutdown during backend shutdown failed (may already be down): {ex.Message}");
+            }
+            await ClearWorkerStateAsync();
+        }
+        Status = BackendStatus.DISABLED;
     }
 
     public override async Task<Image[]> Generate(T2IParamInput user_input)
@@ -515,12 +537,11 @@ public class RunPodServerlessBackend : AbstractT2IBackend
             throw new SwarmReadableErrorException("RunPod Endpoint ID is not configured. Please set it in the backend settings.");
         }
         RunPodApiClient client = new(apiKey, Config.EndpointId);
-        WorkerInfo workerInfo = null;
         try
         {
             Logs.Debug($"[RunPodServerless] Starting generation on endpoint {Config.EndpointId}");
             int keepaliveDuration = 180;
-            workerInfo = await GetOrWakeWorkerAsync(client, keepaliveDuration);
+            WorkerInfo workerInfo = await GetOrWakeWorkerAsync(client, keepaliveDuration);
             Logs.Debug($"[RunPodServerless] Worker ready: {workerInfo.WorkerId} at {workerInfo.PublicUrl}");
             await WaitForWorkerBackendsLoadedAsync(client, workerInfo, Config.StartupTimeoutSec);
             // Ensure the model requested in this generation is selected on the worker
@@ -582,24 +603,6 @@ public class RunPodServerlessBackend : AbstractT2IBackend
             Logs.Error($"[RunPodServerless] Generation failed: {ex.Message}");
             throw new SwarmReadableErrorException($"RunPod generation failed: {ex.Message}");
         }
-        finally
-        {
-            if (workerInfo != null)
-            {
-                try
-                {
-                    Logs.Debug("[RunPodServerless] Sending shutdown signal to worker...");
-                    await client.ShutdownWorkerAsync();
-                    await ClearWorkerStateAsync();
-                    Logs.Debug("[RunPodServerless] Worker shutdown signal sent");
-                }
-                catch (Exception ex)
-                {
-                    Logs.Verbose($"[RunPodServerless] Shutdown signal failed (worker may have already scaled down): {ex.Message}");
-                    await ClearWorkerStateAsync();
-                }
-            }
-        }
     }
 
     /// <summary>Build generation request from T2IParamInput - uses standard ToJSON() like SwarmSwarmBackend.</summary>
@@ -619,6 +622,14 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         // Remove backend selection params - let worker decide
         request.Remove(T2IParamTypes.ExactBackendID.Type.ID);
         request.Remove(T2IParamTypes.BackendType.Type.ID);
+
+        // Forward raw backend data if the caller is listening for it
+        if (input.ReceiveRawBackendData is not null)
+        {
+            request[T2IParamTypes.ForwardRawBackendData.Type.ID] = true;
+        }
+        // Forward Swarm metadata (params_used, etc.)
+        request[T2IParamTypes.ForwardSwarmData.Type.ID] = true;
 
         return request;
     }
@@ -752,12 +763,11 @@ public class RunPodServerlessBackend : AbstractT2IBackend
             throw new SwarmReadableErrorException("RunPod Endpoint ID is not configured. Please set it in the backend settings.");
         }
         RunPodApiClient client = new(apiKey, Config.EndpointId);
-        WorkerInfo workerInfo = null;
         try
         {
             Logs.Debug($"[RunPodServerless] Starting live generation on endpoint {Config.EndpointId}");
             int keepaliveDuration = 300; // Longer keepalive for live generation
-            workerInfo = await GetOrWakeWorkerAsync(client, keepaliveDuration);
+            WorkerInfo workerInfo = await GetOrWakeWorkerAsync(client, keepaliveDuration);
             Logs.Debug($"[RunPodServerless] Worker ready for live generation: {workerInfo.WorkerId} at {workerInfo.PublicUrl}");
             await WaitForWorkerBackendsLoadedAsync(client, workerInfo, Config.StartupTimeoutSec);
 
@@ -805,7 +815,6 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                 {
                     if (user_input.InterruptToken.IsCancellationRequested)
                     {
-                        // Send interrupt signal to worker
                         JObject interruptReq = new()
                         {
                             ["session_id"] = workerInfo.SessionId,
@@ -829,8 +838,6 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                             {
                                 Logs.Verbose($"[RunPodServerless] Got progress from websocket for {batchId}");
                             }
-
-                            // Adjust batch index for local tracking
                             string actualId = batchId;
                             if (objVal.TryGetValue("batch_index", out JToken batchIndRemote) &&
                                 int.TryParse($"{batchIndRemote}", out int batchIndRemoteParsed) &&
@@ -847,6 +854,31 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                         {
                             Logs.Verbose($"[RunPodServerless] Got image from websocket");
                             takeOutput(ImageFile.FromDataString(val.ToString()));
+                        }
+                        else if (response.TryGetValue("raw_backend_data", out JToken rawData))
+                        {
+                            string type = rawData["type"]?.ToString();
+                            string datab64 = rawData["data"]?.ToString();
+                            if (type is not null && datab64 is not null)
+                            {
+                                byte[] data = Convert.FromBase64String(datab64);
+                                user_input.ReceiveRawBackendData?.Invoke(type, data);
+                            }
+                        }
+                        else if (response.TryGetValue("raw_swarm_data", out JToken rawSwarmDataTok) && rawSwarmDataTok is JObject rawSwarmData)
+                        {
+                            Logs.Verbose($"[RunPodServerless] Got raw swarm data from websocket");
+                            if (rawSwarmData.TryGetValue("params_used", out JToken paramsUsed))
+                            {
+                                foreach (JToken paramUsed in paramsUsed)
+                                {
+                                    user_input.ParamsQueried.Add($"{paramUsed}");
+                                }
+                            }
+                            if (user_input.Get(T2IParamTypes.ForwardSwarmData, false))
+                            {
+                                takeOutput(response);
+                            }
                         }
                         else
                         {
@@ -873,24 +905,6 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         {
             Logs.Error($"[RunPodServerless] Live generation failed: {ex.Message}");
             throw new SwarmReadableErrorException($"RunPod live generation failed: {ex.Message}");
-        }
-        finally
-        {
-            if (workerInfo != null)
-            {
-                try
-                {
-                    Logs.Debug("[RunPodServerless] Sending shutdown signal to worker...");
-                    await client.ShutdownWorkerAsync();
-                    await ClearWorkerStateAsync();
-                    Logs.Debug("[RunPodServerless] Worker shutdown signal sent");
-                }
-                catch (Exception ex)
-                {
-                    Logs.Verbose($"[RunPodServerless] Shutdown signal failed (worker may have already scaled down): {ex.Message}");
-                    await ClearWorkerStateAsync();
-                }
-            }
         }
     }
 

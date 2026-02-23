@@ -11,8 +11,8 @@ namespace Hartsy.Extensions.RunPodServerless.WebAPI;
 /// <summary>Client for interacting with RunPod serverless endpoints and workers.</summary>
 public class RunPodApiClient(string apiKey, string endpointId)
 {
-    /// <summary>Shared HTTP client using SwarmUI's infrastructure.</summary>
-    public HttpClient HttpClient = NetworkBackendUtils.MakeHttpClient();
+    /// <summary>Shared HTTP client using SwarmUI's infrastructure. Static to avoid socket exhaustion across instances.</summary>
+    public static HttpClient HttpClient = NetworkBackendUtils.MakeHttpClient();
 
     /// <summary>Wake up worker with keepalive. Returns immediately after initiating wakeup.</summary>
     /// <param name="keepaliveDuration">How long to keep worker alive in seconds (default: 3600)</param>
@@ -112,7 +112,7 @@ public class RunPodApiClient(string apiKey, string endpointId)
         }
         catch (Exception ex)
         {
-            Logs.Error($"[RunPodApiClient] Shutdown signal failed (worker may have already scaled down): {ex.Message}");
+            Logs.Verbose($"[RunPodApiClient] Shutdown signal failed (worker may have already scaled down): {ex.Message}");
         }
     }
 
@@ -143,7 +143,8 @@ public class RunPodApiClient(string apiKey, string endpointId)
     }
 
     /// <summary>Call RunPod handler endpoint (sync or async).</summary>
-    public async Task<JObject> CallRunPodHandlerAsync(JObject payload, bool useSync, CancellationToken cancel)
+    /// <param name="pollTimeoutSec">Max seconds to poll for async job completion (default: 600).</param>
+    public async Task<JObject> CallRunPodHandlerAsync(JObject payload, bool useSync, CancellationToken cancel, int pollTimeoutSec = 600)
     {
         string endpoint = useSync ? "runsync" : "run";
         string url = $"https://api.runpod.ai/v2/{endpointId}/{endpoint}";
@@ -166,17 +167,19 @@ public class RunPodApiClient(string apiKey, string endpointId)
             string jobId = result["id"]?.ToString();
             if (!string.IsNullOrEmpty(jobId))
             {
-                result = await PollJobStatusAsync(jobId, cancel);
+                result = await PollJobStatusAsync(jobId, cancel, pollTimeoutSec);
             }
         }
         return result["output"] as JObject ?? result;
     }
 
     /// <summary>Poll job status for async RunPod calls.</summary>
-    public async Task<JObject> PollJobStatusAsync(string jobId, CancellationToken cancel)
+    /// <param name="pollTimeoutSec">Max seconds to poll before timeout.</param>
+    public async Task<JObject> PollJobStatusAsync(string jobId, CancellationToken cancel, int pollTimeoutSec = 600)
     {
         string url = $"https://api.runpod.ai/v2/{endpointId}/status/{jobId}";
-        int maxAttempts = 300;
+        int pollIntervalMs = 1000;
+        int maxAttempts = Math.Max(1, (pollTimeoutSec * 1000) / pollIntervalMs);
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
             cancel.ThrowIfCancellationRequested();
@@ -195,8 +198,8 @@ public class RunPodApiClient(string apiKey, string endpointId)
                 string error = result["error"]?.ToString() ?? "Job failed";
                 throw new Exception($"RunPod job failed: {error}");
             }
-            await Task.Delay(1000, cancel);
+            await Task.Delay(pollIntervalMs, cancel);
         }
-        throw new TimeoutException($"Job {jobId} did not complete within timeout");
+        throw new TimeoutException($"Job {jobId} did not complete within {pollTimeoutSec} seconds");
     }
 }
