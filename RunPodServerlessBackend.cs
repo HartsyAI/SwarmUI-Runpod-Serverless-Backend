@@ -30,6 +30,9 @@ public class RunPodServerlessBackend : AbstractT2IBackend
     /// <summary>When the current worker's keepalive expires.</summary>
     public DateTime WorkerKeepaliveExpiry = DateTime.MinValue;
 
+    /// <summary>A set of all supported features the remote worker has.</summary>
+    public ConcurrentDictionary<string, string> RemoteFeatureCombo = new();
+
     /// <summary>Lock for worker state management.</summary>
     public SemaphoreSlim WorkerLock = new(1, 1);
 
@@ -115,12 +118,12 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         Session sessData = session ?? Session;
         if (sessData?.User == null)
         {
-            throw new Exception("RunPod API key not found. Please set a backend API key in settings or ensure the calling user has a RunPod API key configured.");
+            throw new SwarmReadableErrorException("RunPod API key not found. No user session is available. Please ensure you are logged in and have a RunPod API key configured in User Settings → API Keys.");
         }
         string apiKey = sessData.User.GetGenericData("runpod_api", "key")?.Trim();
         if (string.IsNullOrEmpty(apiKey))
         {
-            throw new Exception("RunPod API key not found. Please set your API key in User Settings → API Keys.");
+            throw new SwarmReadableErrorException($"RunPod API key is not configured for user '{sessData.User.UserID}'. Please set your RunPod API key in User Settings → API Keys → RunPod.");
         }
         return apiKey;
     }
@@ -128,37 +131,60 @@ public class RunPodServerlessBackend : AbstractT2IBackend
     public override async Task Init()
     {
         AddLoadStatus("Starting RunPod serverless backend...");
-        // Mark backend as RUNNING immediately so the handler can select it and call LoadModel to wake workers on-demand.
-        Status = BackendStatus.RUNNING;
-        // Mark as able to load models so BackendHandler will select this backend
-        // and allow LoadModel() to wake the worker and select the requested model.
-        CanLoadModels = true;
-        Session = Program.Sessions.CreateSession("internal", SessionHandler.LocalUserID);
-        // Try to refresh model listings in the background, but do not block init.
-        _ = Utilities.RunCheckedTask(async () =>
+        if (string.IsNullOrWhiteSpace(Config.EndpointId))
         {
-            try
+            Status = BackendStatus.ERRORED;
+            AddLoadStatus("ERROR: RunPod Endpoint ID is not configured. Please set it in the backend settings.");
+            Logs.Error("[RunPodServerless] Backend cannot start: Endpoint ID is empty. Configure it in the backend settings.");
+            return;
+        }
+        Session = Program.Sessions.CreateSession("internal", SessionHandler.LocalUserID);
+        string apiKey;
+        try
+        {
+            apiKey = GetRunPodApiKey(Session);
+        }
+        catch (Exception ex)
+        {
+            Status = BackendStatus.ERRORED;
+            AddLoadStatus($"ERROR: {ex.Message}");
+            Logs.Error($"[RunPodServerless] Backend cannot start: {ex.Message}");
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            Status = BackendStatus.ERRORED;
+            AddLoadStatus("ERROR: RunPod API key is not configured. Please set your API key in User Settings → API Keys.");
+            Logs.Error("[RunPodServerless] Backend cannot start: RunPod API key is empty. Set it in User Settings → API Keys.");
+            return;
+        }
+        MaxUsages = Math.Max(1, Config.MaxConcurrent);
+        // Mark backend as RUNNING so the handler can select it and call LoadModel to wake workers on-demand.
+        Status = BackendStatus.RUNNING;
+        CanLoadModels = true;
+        AddLoadStatus($"RunPod backend ready (endpoint: {Config.EndpointId}, max concurrent: {MaxUsages}).");
+        // Try to refresh model listings in the background, but do not block init.
+        if (Config.AutoRefresh)
+        {
+            _ = Utilities.RunCheckedTask(async () =>
             {
-                string apiKey = GetRunPodApiKey(Session);
-                if (string.IsNullOrWhiteSpace(apiKey))
+                try
                 {
-                    AddLoadStatus("No RunPod API key configured. Skipping initial model refresh.");
-                    return;
+                    AddLoadStatus("Refreshing models from worker (background)...");
+                    await RefreshModelsFromWorkerAsync(Session);
+                    AddLoadStatus("Model refresh complete.");
+                    Logs.Info($"[RunPodServerless] Model refresh complete. Loaded {Models?.Values.Sum(list => list.Count) ?? 0} models.");
                 }
-                AddLoadStatus("Refreshing models from worker (background)...");
-                await RefreshModelsFromWorkerAsync(Session);
-                AddLoadStatus("RunPod serverless backend ready.");
-                Logs.Info($"[RunPodServerless] Model refresh complete. Loaded {Models?.Values.Sum(list => list.Count) ?? 0} models.");
-            }
-            catch (Exception ex)
-            {
-                AddLoadStatus("Model refresh failed (background): " + ex.Message);
-                Logs.Verbose($"[RunPodServerless] Background model refresh failed: {ex.Message}");
-            }
-        });
+                catch (Exception ex)
+                {
+                    AddLoadStatus("Model refresh failed (background): " + ex.Message);
+                    Logs.Warning($"[RunPodServerless] Background model refresh failed: {ex.Message}");
+                }
+            });
+        }
     }
 
-    /// <summary>Poll the worker's Swarm until all backends have finished loading.</summary>
+    /// <summary>Poll the worker's Swarm until all backends have finished loading. Also updates supported features from the worker.</summary>
     public async Task WaitForWorkerBackendsLoadedAsync(RunPodApiClient client, WorkerInfo worker, int timeoutSec)
     {
         int pollMs = Math.Clamp(Config.PollIntervalMs, 500, 5000);
@@ -176,6 +202,7 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                 var statuses = list.Properties().Select(p => p.Value).OfType<JObject>().Select(b => (id: b["id"]?.ToString(), status: b["status"]?.ToString())).ToList();
                 bool anyLoading = statuses.Any(x => string.Equals(x.status, "loading", StringComparison.OrdinalIgnoreCase));
                 Logs.Debug($"[RunPodServerless] Worker backend statuses: {string.Join(", ", statuses.Select(s => $"{s.id}:{s.status}"))}");
+                UpdateFeaturesFromWorker(list);
                 if (!anyLoading)
                 {
                     Logs.Debug("[RunPodServerless] Worker backends are loaded.");
@@ -480,12 +507,12 @@ public class RunPodServerlessBackend : AbstractT2IBackend
     {
         if (!user_input.SourceSession.User.HasPermission(RunPodPermissions.PermUseRunPod))
         {
-            throw new Exception("You do not have permission to use RunPod Serverless backends.");
+            throw new SwarmReadableErrorException("You do not have permission to use RunPod Serverless backends.");
         }
         string apiKey = GetRunPodApiKey(user_input.SourceSession, user_input);
         if (string.IsNullOrEmpty(Config.EndpointId))
         {
-            throw new Exception("RunPod Endpoint ID is not configured. Please set it in the backend settings.");
+            throw new SwarmReadableErrorException("RunPod Endpoint ID is not configured. Please set it in the backend settings.");
         }
         RunPodApiClient client = new(apiKey, Config.EndpointId);
         WorkerInfo workerInfo = null;
@@ -546,10 +573,14 @@ public class RunPodServerlessBackend : AbstractT2IBackend
             Logs.Debug($"[RunPodServerless] Generated {images.Length} image(s) successfully");
             return images;
         }
+        catch (SwarmReadableErrorException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             Logs.Error($"[RunPodServerless] Generation failed: {ex.Message}");
-            throw new Exception($"RunPod generation failed: {ex.Message}", ex);
+            throw new SwarmReadableErrorException($"RunPod generation failed: {ex.Message}");
         }
         finally
         {
@@ -713,12 +744,12 @@ public class RunPodServerlessBackend : AbstractT2IBackend
     {
         if (!user_input.SourceSession.User.HasPermission(RunPodPermissions.PermUseRunPod))
         {
-            throw new Exception("You do not have permission to use RunPod Serverless backends.");
+            throw new SwarmReadableErrorException("You do not have permission to use RunPod Serverless backends.");
         }
         string apiKey = GetRunPodApiKey(user_input.SourceSession, user_input);
         if (string.IsNullOrEmpty(Config.EndpointId))
         {
-            throw new Exception("RunPod Endpoint ID is not configured. Please set it in the backend settings.");
+            throw new SwarmReadableErrorException("RunPod Endpoint ID is not configured. Please set it in the backend settings.");
         }
         RunPodApiClient client = new(apiKey, Config.EndpointId);
         WorkerInfo workerInfo = null;
@@ -834,10 +865,14 @@ public class RunPodServerlessBackend : AbstractT2IBackend
 
             Logs.Debug($"[RunPodServerless] Live generation completed successfully");
         }
+        catch (SwarmReadableErrorException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             Logs.Error($"[RunPodServerless] Live generation failed: {ex.Message}");
-            throw new Exception($"RunPod live generation failed: {ex.Message}", ex);
+            throw new SwarmReadableErrorException($"RunPod live generation failed: {ex.Message}");
         }
         finally
         {
@@ -859,11 +894,30 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         }
     }
 
-    public override IEnumerable<string> SupportedFeatures
+    /// <inheritdoc/>
+    public override IEnumerable<string> SupportedFeatures => RemoteFeatureCombo.IsEmpty
+        ? ["text2image"]
+        : RemoteFeatureCombo.Keys;
+
+    /// <summary>Update supported features from remote worker backend data.</summary>
+    public void UpdateFeaturesFromWorker(JObject backendData)
     {
-        get
+        HashSet<string> features = ["text2image"];
+        foreach (JToken backend in backendData.Values())
         {
-            yield return "text2image";
+            string status = backend["status"]?.ToString();
+            if (status == "running" && backend["features"] is JArray featureArr)
+            {
+                features.UnionWith(featureArr.Select(f => f.ToString()));
+            }
+        }
+        foreach (string str in features.Where(f => !RemoteFeatureCombo.ContainsKey(f)))
+        {
+            RemoteFeatureCombo.TryAdd(str, str);
+        }
+        foreach (string str in RemoteFeatureCombo.Keys.Where(f => !features.Contains(f)))
+        {
+            RemoteFeatureCombo.TryRemove(str, out _);
         }
     }
 }
