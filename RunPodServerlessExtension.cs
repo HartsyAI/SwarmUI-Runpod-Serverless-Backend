@@ -29,9 +29,11 @@ public class RunPodServerlessExtension : Extension
 
     public override void OnInit()
     {
+        Logs.Verbose("[RunPodServerless] OnInit: registering backend type 'runpod_serverless'...");
         Program.Backends.RegisterBackendType<RunPodServerlessBackend>("runpod_serverless", "RunPod Serverless",
             "Serverless GPU inference via RunPod with direct SwarmUI API access. Supports on-demand scaling and cost-effective generation.",
             CanLoadFast: true);
+        Logs.Verbose("[RunPodServerless] OnInit: adding 'runpod_api' to AcceptedAPIKeyTypes...");
         BasicAPIFeatures.AcceptedAPIKeyTypes.Add("runpod_api");
         try
         {
@@ -60,12 +62,16 @@ public class RunPodServerlessExtension : Extension
                 ModelsAPI.ExtraModelProviders["runpod_serverless"] = (string subtype) =>
                 {
                     RunPodServerlessBackend[] backs = [.. Program.Backends.RunningBackendsOfType<RunPodServerlessBackend>().Where(b => b.RemoteModels is not null)];
+                    Logs.Verbose($"[RunPodServerless] ExtraModelProviders queried for subtype '{subtype}': {backs.Length} backend(s) with RemoteModels");
                     IEnumerable<Dictionary<string, Newtonsoft.Json.Linq.JObject>> sets = backs.Select(b => b.RemoteModels.GetValueOrDefault(subtype)).Where(s => s is not null);
                     if (!sets.Any())
                     {
+                        Logs.Verbose($"[RunPodServerless] ExtraModelProviders: no models found for subtype '{subtype}'");
                         return [];
                     }
-                    return sets.Aggregate((a, b) => a.Union(b).PairsToDictionary(false));
+                    var result = sets.Aggregate((a, b) => a.Union(b).PairsToDictionary(false));
+                    Logs.Verbose($"[RunPodServerless] ExtraModelProviders: returning {result.Count} model(s) for subtype '{subtype}': {string.Join(", ", result.Keys)}");
+                    return result;
                 };
                 Logs.Debug("Registered RunPod Serverless models provider for extra remote models.");
             }
@@ -86,6 +92,7 @@ public class RunPodServerlessExtension : Extension
                 string currentType = p.UserInput.Get(T2IParamTypes.BackendType, "Any");
                 if (!string.IsNullOrEmpty(currentType) && !currentType.Equals("Any", StringComparison.OrdinalIgnoreCase))
                 {
+                    Logs.Verbose($"[RunPodServerless] PreGenerateEvent: explicit BackendType='{currentType}', skipping RunPod routing");
                     return; // Respect explicit backend type
                 }
                 // Determine requested model name
@@ -95,23 +102,35 @@ public class RunPodServerlessExtension : Extension
                 else if (m is string ms) { requestedModel = ms; }
                 if (string.IsNullOrWhiteSpace(requestedModel))
                 {
+                    Logs.Verbose($"[RunPodServerless] PreGenerateEvent: no model requested, skipping RunPod routing");
                     return;
                 }
+                Logs.Verbose($"[RunPodServerless] PreGenerateEvent: checking if model '{requestedModel}' is available on any RunPod backend...");
                 // Check if any RunPod backend reports this model (in any subtype) via RemoteModels
                 foreach (var b in Program.Backends.RunningBackendsOfType<RunPodServerlessBackend>())
                 {
                     var rem = b.RemoteModels;
-                    if (rem is null) { continue; }
+                    if (rem is null)
+                    {
+                        Logs.Verbose($"[RunPodServerless] PreGenerateEvent: backend #{b.BackendData?.ID} has no RemoteModels, skipping");
+                        continue;
+                    }
                     bool found = rem.Values.Any(dict => dict.ContainsKey(requestedModel)
                         || dict.ContainsKey(requestedModel.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase) ? requestedModel[..^".safetensors".Length] : requestedModel)
                         || dict.Keys.Any(k => k.Equals(requestedModel.AfterLast('/'), StringComparison.OrdinalIgnoreCase))
                         || dict.Keys.Any(k => k.Equals((requestedModel.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase) ? requestedModel[..^".safetensors".Length] : requestedModel).AfterLast('/'), StringComparison.OrdinalIgnoreCase)));
                     if (found)
                     {
+                        Logs.Verbose($"[RunPodServerless] PreGenerateEvent: model '{requestedModel}' found on backend #{b.BackendData?.ID}, routing to runpod_serverless");
                         p.UserInput.Set(T2IParamTypes.BackendType, "runpod_serverless");
                         return;
                     }
+                    else
+                    {
+                        Logs.Verbose($"[RunPodServerless] PreGenerateEvent: model '{requestedModel}' not found on backend #{b.BackendData?.ID} (has {rem.Values.Sum(d => d.Count)} remote models)");
+                    }
                 }
+                Logs.Verbose($"[RunPodServerless] PreGenerateEvent: model '{requestedModel}' not found on any RunPod backend, leaving BackendType as Any");
                 // Otherwise: leave BackendType as Any so other backends can match
             };
             Logs.Debug("Registered PreGenerateEvent to default Backend Type to RunPod only when the requested model is available on RunPod.");

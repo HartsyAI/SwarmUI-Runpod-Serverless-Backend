@@ -20,6 +20,7 @@ public static class RunPodWebAPI
     /// <summary>Manually refresh models from worker for all running RunPod backends.</summary>
     public static async Task<JObject> RefreshModels(Session session)
     {
+        Logs.Verbose($"[RunPodWebAPI] RefreshModels API called by session {session?.ID}, user={session?.User?.UserID ?? "<null>"}");
         try
         {
             IEnumerable<RunPodServerlessBackend> backends = Program.Backends.RunningBackendsOfType<RunPodServerlessBackend>();
@@ -27,28 +28,35 @@ public static class RunPodWebAPI
             int failed = 0;
             if (!backends.Any())
             {
+                Logs.Verbose("[RunPodWebAPI] RefreshModels: no RunPod backends are currently running");
                 return new JObject
                 {
                     ["success"] = false,
                     ["error"] = "No RunPod backends are currently running"
                 };
             }
+            Logs.Verbose($"[RunPodWebAPI] RefreshModels: found {backends.Count()} running RunPod backend(s)");
             foreach (RunPodServerlessBackend backend in backends)
             {
                 try
                 {
                     Logs.Debug($"[RunPodWebAPI] Refreshing models for backend #{backend.BackendData.ID} ({backend.Title})...");
+                    Logs.Verbose($"[RunPodWebAPI] Backend #{backend.BackendData.ID}: endpoint={backend.Config.EndpointId}, status={backend.Status}, currentModels={backend.Models?.Values.Sum(list => list.Count) ?? 0}");
                     await backend.RefreshModelsFromWorkerAsync(session);
                     int modelCount = backend.Models?.Values.Sum(list => list.Count) ?? 0;
+                    int remoteCount = backend.RemoteModels?.Values.Sum(dict => dict.Count) ?? 0;
                     Logs.Debug($"[RunPodWebAPI] Backend #{backend.BackendData.ID} now has {modelCount} models");
+                    Logs.Verbose($"[RunPodWebAPI] Backend #{backend.BackendData.ID}: {modelCount} models, {remoteCount} remote metadata entries, subtypes: {string.Join(", ", backend.Models?.Keys ?? [])}");
                     refreshed++;
                 }
                 catch (Exception ex)
                 {
                     Logs.Error($"[RunPodWebAPI] Failed to refresh backend #{backend.BackendData.ID}: {ex.Message}");
+                    Logs.Verbose($"[RunPodWebAPI] Refresh failure details for backend #{backend.BackendData.ID}: {ex}");
                     failed++;
                 }
             }
+            Logs.Verbose($"[RunPodWebAPI] RefreshModels complete: {refreshed} refreshed, {failed} failed");
             return new JObject
             {
                 ["success"] = true,
@@ -71,6 +79,7 @@ public static class RunPodWebAPI
     /// <summary>Get status information for all RunPod backends.</summary>
     public static async Task<JObject> GetStatus(Session session)
     {
+        Logs.Verbose($"[RunPodWebAPI] GetStatus API called by session {session?.ID}");
         try
         {
             IEnumerable<RunPodServerlessBackend> backends = Program.Backends.RunningBackendsOfType<RunPodServerlessBackend>();
@@ -78,6 +87,8 @@ public static class RunPodWebAPI
             foreach (RunPodServerlessBackend backend in backends)
             {
                 int modelCount = backend.Models?.Values.Sum(list => list.Count) ?? 0;
+                int remoteCount = backend.RemoteModels?.Values.Sum(dict => dict.Count) ?? 0;
+                Logs.Verbose($"[RunPodWebAPI] GetStatus: backend #{backend.BackendData.ID} ({backend.Title}): status={backend.Status}, models={modelCount}, remoteModels={remoteCount}, worker={backend.CurrentWorker?.WorkerId ?? "<none>"}, keepaliveJob={backend.ActiveKeepaliveJobId ?? "<none>"}");
                 backendStatuses.Add(new JObject
                 {
                     ["id"] = backend.BackendData.ID,
@@ -89,6 +100,7 @@ public static class RunPodWebAPI
                     ["max_concurrent"] = backend.Config.MaxConcurrent
                 });
             }
+            Logs.Verbose($"[RunPodWebAPI] GetStatus: returning {backendStatuses.Count} backend status(es)");
             return new JObject
             {
                 ["success"] = true,

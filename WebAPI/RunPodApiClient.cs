@@ -1,4 +1,3 @@
-using Hartsy.Extensions.RunPodServerless.Models;
 using Newtonsoft.Json.Linq;
 using SwarmUI.Backends;
 using SwarmUI.Utils;
@@ -8,77 +7,146 @@ using System.Text;
 
 namespace Hartsy.Extensions.RunPodServerless.WebAPI;
 
-/// <summary>Client for interacting with RunPod serverless endpoints and workers.</summary>
+/// <summary>Client for interacting with RunPod serverless endpoints and workers.
+/// All worker lifecycle operations (wakeup, keepalive) use the async /run endpoint to avoid
+/// creating multiple jobs. Status polling uses GET /status which is read-only and free.</summary>
 public class RunPodApiClient(string apiKey, string endpointId)
 {
     /// <summary>Shared HTTP client using SwarmUI's infrastructure. Static to avoid socket exhaustion across instances.</summary>
     public static HttpClient HttpClient = NetworkBackendUtils.MakeHttpClient();
 
-    /// <summary>Wake up worker with keepalive. Returns immediately after initiating wakeup.</summary>
-    /// <param name="keepaliveDuration">How long to keep worker alive in seconds (default: 3600)</param>
-    /// <param name="keepaliveInterval">Ping interval in seconds (default: 30)</param>
-    public async Task WakeupWorkerAsync(int keepaliveDuration = 3600, int keepaliveInterval = 30, CancellationToken cancel = default)
+    // ──────────────────── Core Job Management ────────────────────
+
+    /// <summary>Submit a job to RunPod's async /run endpoint. Returns immediately with the job ID.
+    /// This does NOT wait for the job to complete — use <see cref="WaitForJobAsync"/> for that.</summary>
+    public async Task<string> SubmitJobAsync(JObject payload, CancellationToken cancel = default)
     {
-        JObject payload = new()
+        string url = $"https://api.runpod.ai/v2/{endpointId}/run";
+        string payloadStr = payload.ToString();
+        using HttpRequestMessage request = new(HttpMethod.Post, url)
         {
-            ["input"] = new JObject
-            {
-                ["action"] = "wakeup",
-                ["duration"] = keepaliveDuration,
-                ["interval"] = keepaliveInterval
-            }
+            Content = new StringContent(payloadStr, Encoding.UTF8, "application/json")
         };
-        Logs.Verbose($"[RunPodApiClient] Sending wakeup signal (duration: {keepaliveDuration}s, interval: {keepaliveInterval}s)");
-        await CallRunPodHandlerAsync(payload, useSync: false, cancel);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        string action = payload["input"]?["action"]?.ToString() ?? "unknown";
+        Logs.Debug($"[RunPodApiClient] POST /run (action: {action})");
+        Logs.Verbose($"[RunPodApiClient] SubmitJobAsync: url={url}, payloadSize={payloadStr.Length} chars, action={action}");
+        using HttpResponseMessage response = await HttpClient.SendAsync(request, cancel);
+        Logs.Verbose($"[RunPodApiClient] SubmitJobAsync: response status={response.StatusCode}");
+        if (!response.IsSuccessStatusCode)
+        {
+            string error = await response.Content.ReadAsStringAsync(cancel);
+            Logs.Warning($"[RunPodApiClient] /run failed ({response.StatusCode}): {error}");
+            throw new HttpRequestException($"RunPod /run failed ({response.StatusCode}): {error}");
+        }
+        string content = await response.Content.ReadAsStringAsync(cancel);
+        Logs.Verbose($"[RunPodApiClient] SubmitJobAsync: response body ({content.Length} chars): {content}");
+        JObject result = JObject.Parse(content);
+        string jobId = result["id"]?.ToString();
+        if (string.IsNullOrEmpty(jobId))
+        {
+            throw new Exception($"RunPod /run did not return a job ID. Response: {content}");
+        }
+        Logs.Debug($"[RunPodApiClient] Job submitted: {jobId} (action: {action})");
+        return jobId;
     }
 
-    /// <summary>Check if worker is ready for generation.</summary>
-    public async Task<WorkerReadyResponse> CheckWorkerReadyAsync(CancellationToken cancel = default)
+    /// <summary>Poll a job's status via GET /status/{jobId}.
+    /// This is a read-only API call — it does NOT create new jobs or spin up workers.</summary>
+    public async Task<JObject> GetJobStatusAsync(string jobId, CancellationToken cancel = default)
     {
-        JObject payload = new()
-        {
-            ["input"] = new JObject
-            {
-                ["action"] = "ready"
-            }
-        };
-
-        JObject response = await CallRunPodHandlerAsync(payload, useSync: true, cancel);
-
-        return new WorkerReadyResponse
-        {
-            Ready = response["ready"]?.Value<bool>() ?? false,
-            PublicUrl = response["public_url"]?.ToString(),
-            SessionId = response["session_id"]?.ToString(),
-            WorkerId = response["worker_id"]?.ToString(),
-            Version = response["version"]?.ToString(),
-            Error = response["error"]?.ToString()
-        };
+        string url = $"https://api.runpod.ai/v2/{endpointId}/status/{jobId}";
+        using HttpRequestMessage request = new(HttpMethod.Get, url);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        Logs.Verbose($"[RunPodApiClient] GetJobStatusAsync: GET {url}");
+        using HttpResponseMessage response = await HttpClient.SendAsync(request, cancel);
+        string content = await response.Content.ReadAsStringAsync(cancel);
+        Logs.Verbose($"[RunPodApiClient] GetJobStatusAsync: {response.StatusCode} ({content.Length} chars)");
+        return JObject.Parse(content);
     }
 
-    /// <summary>Perform health check on worker.</summary>
-    public async Task<bool> HealthCheckAsync(CancellationToken cancel = default)
+    /// <summary>Poll a job until it reaches COMPLETED or FAILED. Returns the output from the completed job.
+    /// Uses GET /status which is read-only — no new jobs or workers are created during polling.</summary>
+    public async Task<JObject> WaitForJobAsync(string jobId, int pollIntervalMs = 2000, int timeoutSec = 600, CancellationToken cancel = default)
     {
+        Logs.Verbose($"[RunPodApiClient] WaitForJobAsync: jobId={jobId}, pollInterval={pollIntervalMs}ms, timeout={timeoutSec}s");
+        DateTime deadline = DateTime.UtcNow.AddSeconds(timeoutSec);
+        string lastStatus = "";
+        int attempt = 0;
+        while (DateTime.UtcNow < deadline)
+        {
+            cancel.ThrowIfCancellationRequested();
+            attempt++;
+            JObject result = await GetJobStatusAsync(jobId, cancel);
+            string status = result["status"]?.ToString() ?? "UNKNOWN";
+            // Log status changes at Info level, repeated statuses at Verbose
+            if (status != lastStatus)
+            {
+                int elapsed = (int)(DateTime.UtcNow - deadline.AddSeconds(-timeoutSec)).TotalSeconds;
+                Logs.Info($"[RunPodApiClient] Job {jobId}: {status} (after {elapsed}s)");
+                lastStatus = status;
+            }
+            else
+            {
+                Logs.Verbose($"[RunPodApiClient] Job {jobId}: {status} (poll #{attempt})");
+            }
+            if (status == "COMPLETED")
+            {
+                JObject output = result["output"] as JObject ?? new JObject();
+                Logs.Verbose($"[RunPodApiClient] WaitForJobAsync: job {jobId} COMPLETED. Output keys: {string.Join(", ", output.Properties().Select(p => p.Name))}");
+                return output;
+            }
+            else if (status == "FAILED")
+            {
+                string error = result["error"]?.ToString() ?? "Unknown error";
+                Logs.Verbose($"[RunPodApiClient] WaitForJobAsync: job {jobId} FAILED. Error: {error}");
+                throw new Exception($"RunPod job {jobId} failed: {error}");
+            }
+            // IN_QUEUE or IN_PROGRESS — keep polling
+            await Task.Delay(pollIntervalMs, cancel);
+        }
+        throw new TimeoutException($"Job {jobId} did not complete within {timeoutSec}s");
+    }
+
+    /// <summary>Cancel a queued or running job. Best-effort — does not throw on failure.</summary>
+    public async Task CancelJobAsync(string jobId, CancellationToken cancel = default)
+    {
+        if (string.IsNullOrEmpty(jobId)) return;
         try
         {
-            JObject payload = new()
-            {
-                ["input"] = new JObject
-                {
-                    ["action"] = "health"
-                }
-            };
-            JObject response = await CallRunPodHandlerAsync(payload, useSync: true, cancel);
-            return response["healthy"]?.Value<bool>() ?? false;
+            string url = $"https://api.runpod.ai/v2/{endpointId}/cancel/{jobId}";
+            using HttpRequestMessage request = new(HttpMethod.Post, url);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+            Logs.Debug($"[RunPodApiClient] Cancelling job {jobId}");
+            using HttpResponseMessage response = await HttpClient.SendAsync(request, cancel);
+            Logs.Debug($"[RunPodApiClient] Cancel {jobId}: {response.StatusCode}");
         }
-        catch
+        catch (Exception ex)
         {
-            return false;
+            Logs.Verbose($"[RunPodApiClient] Cancel failed for {jobId} (may already be done): {ex.Message}");
         }
     }
 
-    /// <summary>Send keepalive to extend worker lifetime.</summary>
-    public async Task KeepAliveAsync(int duration = 3600, int interval = 30, CancellationToken cancel = default)
+    // ──────────────────── Worker Lifecycle ────────────────────
+
+    /// <summary>Submit a wakeup job via /run. The handler should return quickly with connection info
+    /// (public_url, session_id, worker_id). Returns the job ID — use <see cref="WaitForJobAsync"/> to get the output.</summary>
+    public async Task<string> WakeupWorkerAsync(CancellationToken cancel = default)
+    {
+        JObject payload = new()
+        {
+            ["input"] = new JObject
+            {
+                ["action"] = "wakeup"
+            }
+        };
+        Logs.Info("[RunPodApiClient] Submitting wakeup job...");
+        return await SubmitJobAsync(payload, cancel);
+    }
+
+    /// <summary>Submit a keepalive job to keep the worker alive for the specified duration.
+    /// This job runs a blocking ping loop on the worker. Returns the job ID for later cancellation.</summary>
+    public async Task<string> SubmitKeepaliveAsync(int duration = 3600, int interval = 30, CancellationToken cancel = default)
     {
         JObject payload = new()
         {
@@ -89,34 +157,14 @@ public class RunPodApiClient(string apiKey, string endpointId)
                 ["interval"] = interval
             }
         };
-        await CallRunPodHandlerAsync(payload, useSync: false, cancel);
+        Logs.Debug($"[RunPodApiClient] Submitting keepalive job (duration: {duration}s, interval: {interval}s)");
+        return await SubmitJobAsync(payload, cancel);
     }
 
-    /// <summary>Signal worker to shutdown gracefully.</summary>
-    public async Task ShutdownWorkerAsync(CancellationToken cancel = default)
-    {
-        try
-        {
-            JObject payload = new()
-            {
-                ["input"] = new JObject
-                {
-                    ["action"] = "shutdown"
-                }
-            };
-            JObject response = await CallRunPodHandlerAsync(payload, useSync: true, cancel);
-            if (response["success"]?.Value<bool>() == true)
-            {
-                Logs.Verbose("[RunPodApiClient] Shutdown signal acknowledged by worker");
-            }
-        }
-        catch (Exception ex)
-        {
-            Logs.Verbose($"[RunPodApiClient] Shutdown signal failed (worker may have already scaled down): {ex.Message}");
-        }
-    }
+    // ──────────────────── Direct Worker Communication ────────────────────
 
-    /// <summary>Make direct API call to SwarmUI instance running on worker.</summary>
+    /// <summary>Make direct API call to SwarmUI instance running on worker via its public URL.
+    /// This bypasses RunPod's job system entirely — no new jobs are created.</summary>
     public async Task<JObject> CallSwarmUIAsync(string workerPublicUrl, string apiPath, JObject requestBody, int timeoutSeconds = 600, CancellationToken cancel = default)
     {
         if (string.IsNullOrEmpty(workerPublicUrl))
@@ -128,78 +176,19 @@ public class RunPodApiClient(string apiKey, string endpointId)
         {
             Content = new StringContent(requestBody.ToString(), Encoding.UTF8, "application/json")
         };
-        Logs.Verbose($"[RunPodApiClient] Calling SwarmUI: POST {url}");
+        Logs.Verbose($"[RunPodApiClient] SwarmUI direct call: POST {url} (timeout: {timeoutSeconds}s, bodySize: {requestBody.ToString().Length} chars)");
         using HttpResponseMessage response = await HttpClient.SendAsync(request, cancel);
+        Logs.Verbose($"[RunPodApiClient] SwarmUI direct call response: {response.StatusCode} for {apiPath}");
         if (!response.IsSuccessStatusCode)
         {
             string error = await response.Content.ReadAsStringAsync(cancel);
+            Logs.Verbose($"[RunPodApiClient] SwarmUI direct call error body: {error}");
             throw new HttpRequestException($"SwarmUI API call failed ({response.StatusCode}): {error}");
         }
         string content = await response.Content.ReadAsStringAsync(cancel);
+        Logs.Verbose($"[RunPodApiClient] SwarmUI direct call success: {apiPath} ({content.Length} chars)");
         JObject result = JObject.Parse(content);
-        // Check for session errors and throw if found
         RunPodServerlessBackend.AutoThrowException(result);
         return result;
-    }
-
-    /// <summary>Call RunPod handler endpoint (sync or async).</summary>
-    /// <param name="pollTimeoutSec">Max seconds to poll for async job completion (default: 600).</param>
-    public async Task<JObject> CallRunPodHandlerAsync(JObject payload, bool useSync, CancellationToken cancel, int pollTimeoutSec = 600)
-    {
-        string endpoint = useSync ? "runsync" : "run";
-        string url = $"https://api.runpod.ai/v2/{endpointId}/{endpoint}";
-        using HttpRequestMessage request = new(HttpMethod.Post, url)
-        {
-            Content = new StringContent(payload.ToString(), Encoding.UTF8, "application/json")
-        };
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-        Logs.Verbose($"[RunPodApiClient] Calling RunPod handler: {endpoint}");
-        using HttpResponseMessage response = await HttpClient.SendAsync(request, cancel);
-        if (!response.IsSuccessStatusCode)
-        {
-            string error = await response.Content.ReadAsStringAsync(cancel);
-            throw new HttpRequestException($"RunPod API call failed ({response.StatusCode}): {error}");
-        }
-        string content = await response.Content.ReadAsStringAsync(cancel);
-        JObject result = JObject.Parse(content);
-        if (!useSync)
-        {
-            string jobId = result["id"]?.ToString();
-            if (!string.IsNullOrEmpty(jobId))
-            {
-                result = await PollJobStatusAsync(jobId, cancel, pollTimeoutSec);
-            }
-        }
-        return result["output"] as JObject ?? result;
-    }
-
-    /// <summary>Poll job status for async RunPod calls.</summary>
-    /// <param name="pollTimeoutSec">Max seconds to poll before timeout.</param>
-    public async Task<JObject> PollJobStatusAsync(string jobId, CancellationToken cancel, int pollTimeoutSec = 600)
-    {
-        string url = $"https://api.runpod.ai/v2/{endpointId}/status/{jobId}";
-        int pollIntervalMs = 1000;
-        int maxAttempts = Math.Max(1, (pollTimeoutSec * 1000) / pollIntervalMs);
-        for (int attempt = 0; attempt < maxAttempts; attempt++)
-        {
-            cancel.ThrowIfCancellationRequested();
-            using HttpRequestMessage request = new(HttpMethod.Get, url);
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-            using HttpResponseMessage response = await HttpClient.SendAsync(request, cancel);
-            string content = await response.Content.ReadAsStringAsync(cancel);
-            JObject result = JObject.Parse(content);
-            string status = result["status"]?.ToString();
-            if (status == "COMPLETED")
-            {
-                return result;
-            }
-            else if (status == "FAILED")
-            {
-                string error = result["error"]?.ToString() ?? "Job failed";
-                throw new Exception($"RunPod job failed: {error}");
-            }
-            await Task.Delay(pollIntervalMs, cancel);
-        }
-        throw new TimeoutException($"Job {jobId} did not complete within {pollTimeoutSec} seconds");
     }
 }
