@@ -487,8 +487,9 @@ public class RunPodServerlessBackend : AbstractT2IBackend
 
                     await Task.WhenAll(fetches);
                     int total = tempModels.Values.Sum(list => list.Count);
-                    Logs.Verbose($"[RunPodServerless] Model fetch round complete: {total} models found across {tempModels.Count} subtypes");
-                    if (total > 0)
+                    int sdCount = tempModels.TryGetValue("Stable-Diffusion", out var sdList) ? sdList.Count : 0;
+                    Logs.Verbose($"[RunPodServerless] Model fetch round complete: {total} models found across {tempModels.Count} subtypes ({sdCount} Stable-Diffusion)");
+                    if (sdCount > 0)
                     {
                         RemoteModels ??= new ConcurrentDictionary<string, Dictionary<string, JObject>>();
                         Models ??= new ConcurrentDictionary<string, List<string>>();
@@ -510,9 +511,9 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                     int elapsedSec = (int)(DateTime.UtcNow - start).TotalSeconds;
                     if (elapsedSec >= maxWaitSec)
                     {
-                        throw new TimeoutException($"No models discovered within {maxWaitSec} seconds.");
+                        throw new TimeoutException($"No Stable-Diffusion models discovered within {maxWaitSec} seconds ({total} other models found).");
                     }
-                    Logs.Verbose($"[RunPodServerless] No models found yet ({elapsedSec}s elapsed, max {maxWaitSec}s), retrying in {retryIntervalMs}ms...");
+                    Logs.Verbose($"[RunPodServerless] No Stable-Diffusion models found yet ({sdCount} SD, {total} total, {elapsedSec}s elapsed, max {maxWaitSec}s), retrying in {retryIntervalMs}ms...");
                     AddLoadStatus("Waiting for Swarm to finish loading models on worker...");
                     await Task.Delay(retryIntervalMs);
                 }
