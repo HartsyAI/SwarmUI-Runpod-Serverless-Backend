@@ -389,13 +389,13 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         Logs.Verbose($"[RunPodServerless] RefreshModelsFromWorkerAsync called for backend #{BackendData?.ID}");
         string apiKey = GetRunPodApiKey(session);
         RunPodApiClient client = new(apiKey, Config.EndpointId);
-        // Keep the worker alive for at least our retry window.
+        // Keep the worker alive long enough for model listing retries; generations will extend as needed.
         int retryIntervalMs = 10_000; // 10 seconds between attempts
         int maxWaitSec = Math.Max(Config.StartupTimeoutSec, 120);
-        int keepaliveDuration = maxWaitSec + 60; // buffer above max wait
+        int keepaliveDuration = 180; // 3 minutes — GetOrWakeWorkerAsync will extend on-demand
         Logs.Debug($"[RunPodServerless] Starting worker for model refresh (keepalive: {keepaliveDuration}s)...");
         Logs.Verbose($"[RunPodServerless] RefreshModels config: maxWaitSec={maxWaitSec}, retryInterval={retryIntervalMs}ms, keepalive={keepaliveDuration}s");
-        WorkerInfo worker = await WakeupAndWaitForWorkerAsync(client, keepaliveDuration);
+        WorkerInfo worker = await GetOrWakeWorkerAsync(client, keepaliveDuration);
         Logs.Debug($"[RunPodServerless] Worker ready: {worker.WorkerId} at {worker.PublicUrl}");
         Logs.Verbose($"[RunPodServerless] Worker details: publicUrl={worker.PublicUrl}, sessionId={worker.SessionId?[..Math.Min(16, worker.SessionId?.Length ?? 0)]}..., version={worker.Version}");
 
@@ -531,22 +531,7 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         }
         finally
         {
-            try
-            {
-                // Cancel keepalive job so worker scales down after idle timeout
-                if (!string.IsNullOrEmpty(ActiveKeepaliveJobId))
-                {
-                    Logs.Debug($"[RunPodServerless] Cancelling keepalive job {ActiveKeepaliveJobId} after model refresh...");
-                    await client.CancelJobAsync(ActiveKeepaliveJobId);
-                }
-                await ClearWorkerStateAsync();
-                Logs.Debug("[RunPodServerless] Worker cleanup complete after model refresh.");
-            }
-            catch (Exception ex)
-            {
-                Logs.Verbose($"[RunPodServerless] Worker cleanup ignored: {ex.Message}");
-                await ClearWorkerStateAsync();
-            }
+            Logs.Debug($"[RunPodServerless] Model refresh finished. Worker {CurrentWorker?.WorkerId ?? "<null>"} remains cached for subsequent operations.");
         }
     }
 
@@ -735,6 +720,10 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         Logs.Verbose($"[RunPodServerless] ExtractGeneratedImages: decoded {images.Count}/{imageArray.Count} images successfully");
         return [.. images];
     }
+
+    // TODO: Implement queue pressure detection — if the job queue stays long for a sustained period,
+    // spin up an additional worker to relieve the load. Needs a strategy to measure queue depth over
+    // time (not just a momentary spike) before committing to a new worker.
 
     /// <summary>Get active worker or wake up a new one. Thread-safe with state tracking.</summary>
     public async Task<WorkerInfo> GetOrWakeWorkerAsync(RunPodApiClient client, int keepaliveDuration)
