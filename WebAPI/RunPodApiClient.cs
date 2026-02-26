@@ -15,8 +15,6 @@ public class RunPodApiClient(string apiKey, string endpointId)
     /// <summary>Shared HTTP client using SwarmUI's infrastructure. Static to avoid socket exhaustion across instances.</summary>
     public static HttpClient HttpClient = NetworkBackendUtils.MakeHttpClient();
 
-    // ──────────────────── Core Job Management ────────────────────
-
     /// <summary>Submit a job to RunPod's async /run endpoint. Returns immediately with the job ID.
     /// This does NOT wait for the job to complete — use <see cref="WaitForJobAsync"/> for that.</summary>
     public async Task<string> SubmitJobAsync(JObject payload, CancellationToken cancel = default)
@@ -79,8 +77,7 @@ public class RunPodApiClient(string apiKey, string endpointId)
             attempt++;
             JObject result = await GetJobStatusAsync(jobId, cancel);
             string status = result["status"]?.ToString() ?? "UNKNOWN";
-            // Log status changes at Info level, repeated statuses at Verbose
-            if (status != lastStatus)
+            if (status is not lastStatus)
             {
                 int elapsed = (int)(DateTime.UtcNow - deadline.AddSeconds(-timeoutSec)).TotalSeconds;
                 Logs.Info($"[RunPodApiClient] Job {jobId}: {status} (after {elapsed}s)");
@@ -90,13 +87,13 @@ public class RunPodApiClient(string apiKey, string endpointId)
             {
                 Logs.Verbose($"[RunPodApiClient] Job {jobId}: {status} (poll #{attempt})");
             }
-            if (status == "COMPLETED")
+            if (status is "COMPLETED")
             {
                 JObject output = result["output"] as JObject ?? new JObject();
                 Logs.Verbose($"[RunPodApiClient] WaitForJobAsync: job {jobId} COMPLETED. Output keys: {string.Join(", ", output.Properties().Select(p => p.Name))}");
                 return output;
             }
-            else if (status == "FAILED")
+            else if (status is "FAILED")
             {
                 string error = result["error"]?.ToString() ?? "Unknown error";
                 Logs.Verbose($"[RunPodApiClient] WaitForJobAsync: job {jobId} FAILED. Error: {error}");
@@ -126,8 +123,6 @@ public class RunPodApiClient(string apiKey, string endpointId)
             Logs.Verbose($"[RunPodApiClient] Cancel failed for {jobId} (may already be done): {ex.Message}");
         }
     }
-
-    // ──────────────────── Worker Lifecycle ────────────────────
 
     /// <summary>Submit a wakeup job via /run. The handler should return quickly with connection info
     /// (public_url, session_id, worker_id). Returns the job ID — use <see cref="WaitForJobAsync"/> to get the output.</summary>
@@ -160,8 +155,6 @@ public class RunPodApiClient(string apiKey, string endpointId)
         Logs.Debug($"[RunPodApiClient] Submitting keepalive job (duration: {duration}s, interval: {interval}s)");
         return await SubmitJobAsync(payload, cancel);
     }
-
-    // ──────────────────── Direct Worker Communication ────────────────────
 
     /// <summary>Make direct API call to SwarmUI instance running on worker via its public URL.
     /// This bypasses RunPod's job system entirely — no new jobs are created.</summary>

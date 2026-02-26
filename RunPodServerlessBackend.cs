@@ -1,4 +1,5 @@
 using FreneticUtilities.FreneticDataSyntax;
+using FreneticUtilities.FreneticExtensions;
 using Hartsy.Extensions.RunPodServerless;
 using Hartsy.Extensions.RunPodServerless.Models;
 using Hartsy.Extensions.RunPodServerless.WebAPI;
@@ -124,7 +125,7 @@ public class RunPodServerlessBackend : AbstractT2IBackend
     {
         Session sessData = session ?? Session;
         Logs.Verbose($"[RunPodServerless] GetRunPodApiKey: session={sessData?.ID}, user={sessData?.User?.UserID ?? "<null>"}");
-        if (sessData?.User == null)
+        if (sessData?.User is null)
         {
             throw new SwarmReadableErrorException("RunPod API key not found. No user session is available. Please ensure you are logged in and have a RunPod API key configured in User Settings → API Keys.");
         }
@@ -171,12 +172,11 @@ public class RunPodServerlessBackend : AbstractT2IBackend
             return;
         }
         MaxUsages = Math.Max(1, Config.MaxConcurrent);
-        // Mark backend as RUNNING so the handler can select it and call LoadModel to wake workers on-demand.
+        // Mark backend as RUNNING so the handler can select it and call LoadModel to wake workers on demand.
         Status = BackendStatus.RUNNING;
         CanLoadModels = true;
         Logs.Verbose($"[RunPodServerless] Backend #{BackendData?.ID} marked as RUNNING, CanLoadModels=true, MaxUsages={MaxUsages}");
         AddLoadStatus($"RunPod backend ready (endpoint: {Config.EndpointId}, max concurrent: {MaxUsages}).");
-        // Try to refresh model listings in the background, but do not block init.
         if (Config.AutoRefresh)
         {
             Logs.Verbose($"[RunPodServerless] AutoRefresh enabled, starting background model refresh task...");
@@ -224,7 +224,7 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                     ["nonreal"] = true,
                     ["full_data"] = true
                 }, timeoutSeconds: 30);
-                var statuses = list.Properties().Select(p => p.Value).OfType<JObject>().Select(b => (id: b["id"]?.ToString(), status: b["status"]?.ToString())).ToList();
+                List<(string id, string status)> statuses = list.Properties().Select(p => p.Value).OfType<JObject>().Select(b => (id: b["id"]?.ToString(), status: b["status"]?.ToString())).ToList();
                 bool anyLoading = statuses.Any(x => string.Equals(x.status, "loading", StringComparison.OrdinalIgnoreCase));
                 Logs.Debug($"[RunPodServerless] Worker backend statuses: {string.Join(", ", statuses.Select(s => $"{s.id}:{s.status}"))}");
                 UpdateFeaturesFromWorker(list);
@@ -305,12 +305,9 @@ public class RunPodServerlessBackend : AbstractT2IBackend
             }
             static string ToggleSafetensors(string name)
             {
-                return name.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase)
-                    ? name[..^".safetensors".Length]
-                    : name + ".safetensors";
+                return name.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase) ? name[..^".safetensors".Length] : name + ".safetensors";
             }
-            string basename = desiredModel?.Contains('/') == true ? desiredModel[(desiredModel.LastIndexOf('/') + 1)..] : desiredModel;
-            // Try a set of reasonable candidates
+            string basename = desiredModel?.Contains('/') is true ? desiredModel[(desiredModel.LastIndexOf('/') + 1)..] : desiredModel;
             string[] candidates = new[]
             {
                 desiredModel,
@@ -329,7 +326,6 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                     return true;
                 }
             }
-            // Fallback: query worker model list and best-match
             try
             {
                 JObject listReq = new()
@@ -344,15 +340,12 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                     ["dataImages"] = false
                 };
                 JObject listResp = await client.CallSwarmUIAsync(worker.PublicUrl, "/API/ListModels", listReq, timeoutSeconds: 60);
-                var files = (listResp["files"] as JArray)?.Select(t => t.Type == JTokenType.Object ? t["name"]?.ToString() ?? t.ToString() : t.ToString()).Where(n => !string.IsNullOrWhiteSpace(n)).ToList() ?? new List<string>();
+                List<string> files = (listResp["files"] as JArray)?.Select(t => t.Type == JTokenType.Object ? t["name"]?.ToString() ?? t.ToString() : t.ToString()).Where(n => !string.IsNullOrWhiteSpace(n)).ToList() ?? new List<string>();
                 Logs.Verbose($"[RunPodServerless] Worker has {files.Count} models for subtype 'Stable-Diffusion': {string.Join(", ", files)}");
                 string dl = desiredModel ?? "";
                 string dlBase = basename ?? dl;
-                // prefer exact case-insensitive, then endswith, then contains
-                string best = files.FirstOrDefault(n => n.Equals(dl, StringComparison.OrdinalIgnoreCase))
-                    ?? files.FirstOrDefault(n => n.Equals(dlBase, StringComparison.OrdinalIgnoreCase))
-                    ?? files.FirstOrDefault(n => n.EndsWith(dlBase, StringComparison.OrdinalIgnoreCase))
-                    ?? files.FirstOrDefault(n => n.Contains(dlBase, StringComparison.OrdinalIgnoreCase));
+                string best = files.FirstOrDefault(n => n.Equals(dl, StringComparison.OrdinalIgnoreCase)) ?? files.FirstOrDefault(n => n.Equals(dlBase, StringComparison.OrdinalIgnoreCase))
+                    ?? files.FirstOrDefault(n => n.EndsWith(dlBase, StringComparison.OrdinalIgnoreCase)) ?? files.FirstOrDefault(n => n.Contains(dlBase, StringComparison.OrdinalIgnoreCase));
                 if (!string.IsNullOrWhiteSpace(best))
                 {
                     Logs.Debug($"[RunPodServerless] Retrying SelectModel with worker-listed name: {best}");
@@ -389,16 +382,14 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         Logs.Verbose($"[RunPodServerless] RefreshModelsFromWorkerAsync called for backend #{BackendData?.ID}");
         string apiKey = GetRunPodApiKey(session);
         RunPodApiClient client = new(apiKey, Config.EndpointId);
-        // Keep the worker alive long enough for model listing retries; generations will extend as needed.
         int retryIntervalMs = 10_000; // 10 seconds between attempts
         int maxWaitSec = Math.Max(Config.StartupTimeoutSec, 120);
-        int keepaliveDuration = 180; // 3 minutes — GetOrWakeWorkerAsync will extend on-demand
+        int keepaliveDuration = 180; // 3 minutes — GetOrWakeWorkerAsync will extend
         Logs.Debug($"[RunPodServerless] Starting worker for model refresh (keepalive: {keepaliveDuration}s)...");
         Logs.Verbose($"[RunPodServerless] RefreshModels config: maxWaitSec={maxWaitSec}, retryInterval={retryIntervalMs}ms, keepalive={keepaliveDuration}s");
         WorkerInfo worker = await GetOrWakeWorkerAsync(client, keepaliveDuration);
         Logs.Debug($"[RunPodServerless] Worker ready: {worker.WorkerId} at {worker.PublicUrl}");
         Logs.Verbose($"[RunPodServerless] Worker details: publicUrl={worker.PublicUrl}, sessionId={worker.SessionId?[..Math.Min(16, worker.SessionId?.Length ?? 0)]}..., version={worker.Version}");
-
         DateTime start = DateTime.UtcNow;
         Exception lastError = null;
         try
@@ -407,10 +398,8 @@ public class RunPodServerlessBackend : AbstractT2IBackend
             {
                 try
                 {
-                    // temp holders to only commit once we have a non-empty set
-                    var tempModels = new ConcurrentDictionary<string, List<string>>();
-                    var tempRemoteModels = new ConcurrentDictionary<string, Dictionary<string, JObject>>();
-
+                    ConcurrentDictionary<string, List<string>> tempModels = new();
+                    ConcurrentDictionary<string, Dictionary<string, JObject>> tempRemoteModels = new();
                     List<Task> fetches = [];
                     Logs.Verbose($"[RunPodServerless] Fetching models for {Program.T2IModelSets.Keys.Count()} subtypes: {string.Join(", ", Program.T2IModelSets.Keys)}");
                     foreach (string subtype in Program.T2IModelSets.Keys)
@@ -454,6 +443,14 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                                             JObject data = (JObject)fileObj.DeepClone();
                                             data["local"] = false;
                                             data["subtype"] = subtypeLocal;
+                                            data["loaded"] ??= false;
+                                            data["standard_width"] ??= 0;
+                                            data["standard_height"] ??= 0;
+                                            data["architecture"] ??= "";
+                                            data["title"] ??= modelName.AfterLast('/');
+                                            data["description"] ??= "";
+                                            data["preview_image"] ??= "imgs/model_placeholder.jpg";
+                                            data["is_supported_model_format"] ??= true;
                                             modelMetadata[modelName] = data;
                                         }
                                     }
@@ -467,7 +464,15 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                                             {
                                                 ["name"] = modelName,
                                                 ["local"] = false,
-                                                ["subtype"] = subtypeLocal
+                                                ["subtype"] = subtypeLocal,
+                                                ["loaded"] = false,
+                                                ["standard_width"] = 0,
+                                                ["standard_height"] = 0,
+                                                ["architecture"] = "",
+                                                ["title"] = modelName.AfterLast('/'),
+                                                ["description"] = "",
+                                                ["preview_image"] = "imgs/model_placeholder.jpg",
+                                                ["is_supported_model_format"] = true
                                             };
                                         }
                                     }
@@ -484,30 +489,28 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                             }
                         }));
                     }
-
                     await Task.WhenAll(fetches);
                     int total = tempModels.Values.Sum(list => list.Count);
-                    int sdCount = tempModels.TryGetValue("Stable-Diffusion", out var sdList) ? sdList.Count : 0;
+                    int sdCount = tempModels.TryGetValue("Stable-Diffusion", out List<string> sdList) ? sdList.Count : 0;
                     Logs.Verbose($"[RunPodServerless] Model fetch round complete: {total} models found across {tempModels.Count} subtypes ({sdCount} Stable-Diffusion)");
                     if (sdCount > 0)
                     {
                         RemoteModels ??= new ConcurrentDictionary<string, Dictionary<string, JObject>>();
                         Models ??= new ConcurrentDictionary<string, List<string>>();
-                        foreach (var kv in tempModels)
+                        foreach (KeyValuePair<string, List<string>> kv in tempModels)
                         {
                             Models[kv.Key] = kv.Value;
                             Logs.Verbose($"[RunPodServerless] Registered {kv.Value.Count} models for subtype '{kv.Key}': {string.Join(", ", kv.Value)}");
                         }
-                        foreach (var kv in tempRemoteModels)
+                        foreach (KeyValuePair<string, Dictionary<string, JObject>> kv in tempRemoteModels)
                         {
                             RemoteModels[kv.Key] = kv.Value;
                         }
                         Logs.Debug($"[RunPodServerless] Model refresh complete: {total} models across {tempModels.Count} subtypes");
                         Logs.Verbose($"[RunPodServerless] RemoteModels now has {RemoteModels.Values.Sum(d => d.Count)} total metadata entries");
+                        Program.ModelRefreshEvent?.Invoke();
                         return;
                     }
-
-                    // No models yet; check timeout and retry after 10 seconds
                     int elapsedSec = (int)(DateTime.UtcNow - start).TotalSeconds;
                     if (elapsedSec >= maxWaitSec)
                     {
@@ -535,6 +538,7 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         }
     }
 
+    /// <inheritdoc/>
     public override async Task Shutdown()
     {
         Logs.Info($"[RunPodServerless] Backend {BackendData?.ID} shutting down...");
@@ -545,7 +549,6 @@ public class RunPodServerlessBackend : AbstractT2IBackend
             {
                 string apiKey = GetRunPodApiKey(Session);
                 RunPodApiClient client = new(apiKey, Config.EndpointId);
-                // Cancel the keepalive job — worker will scale down after idle timeout
                 if (!string.IsNullOrEmpty(ActiveKeepaliveJobId))
                 {
                     Logs.Debug($"[RunPodServerless] Cancelling keepalive job {ActiveKeepaliveJobId}...");
@@ -572,6 +575,7 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         Logs.Verbose($"[RunPodServerless] Backend #{BackendData?.ID} status set to DISABLED");
     }
 
+    /// <inheritdoc/>
     public override async Task<Image[]> Generate(T2IParamInput user_input)
     {
         Logs.Verbose($"[RunPodServerless] Generate called on backend #{BackendData?.ID}, user={user_input.SourceSession?.User?.UserID ?? "<null>"}");
@@ -594,7 +598,6 @@ public class RunPodServerlessBackend : AbstractT2IBackend
             Logs.Debug($"[RunPodServerless] Worker ready: {workerInfo.WorkerId} at {workerInfo.PublicUrl}");
             Logs.Verbose($"[RunPodServerless] Generate: worker session={workerInfo.SessionId?[..Math.Min(16, workerInfo.SessionId?.Length ?? 0)]}...");
             await WaitForWorkerBackendsLoadedAsync(client, workerInfo, Config.StartupTimeoutSec);
-            // Ensure the model requested in this generation is selected on the worker
             string genModel = null;
             object mobj = user_input.Get(T2IParamTypes.Model);
             if (mobj is T2IModel tmm) { genModel = tmm.Name; }
@@ -611,10 +614,7 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                 bool selOk = selResp.TryGetValue("success", out JToken sr) && sr.Value<bool>();
                 if (!selOk)
                 {
-                    // Retry with alternate name if needed
-                    string alt = genModel.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase)
-                        ? genModel[..^".safetensors".Length]
-                        : genModel + ".safetensors";
+                    string alt = genModel.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase) ? genModel[..^".safetensors".Length] : genModel + ".safetensors";
                     if (!string.Equals(alt, genModel, StringComparison.OrdinalIgnoreCase))
                     {
                         Logs.Debug($"[RunPodServerless] Retry SelectModel with alt: {alt}");
@@ -635,11 +635,10 @@ public class RunPodServerlessBackend : AbstractT2IBackend
             JObject swarmRequest = BuildGenerationRequest(user_input, workerInfo.SessionId);
             Logs.Debug("[RunPodServerless] Sending generation request to worker...");
             Logs.Verbose($"[RunPodServerless] Generate request keys: {string.Join(", ", swarmRequest.Properties().Select(p => p.Name))}");
-            JObject swarmResponse = await client.CallSwarmUIAsync(workerInfo.PublicUrl, "/API/GenerateText2Image", swarmRequest,
-                timeoutSeconds: Config.GenerationTimeoutSec);
+            JObject swarmResponse = await client.CallSwarmUIAsync(workerInfo.PublicUrl, "/API/GenerateText2Image", swarmRequest, timeoutSeconds: Config.GenerationTimeoutSec);
             Logs.Verbose($"[RunPodServerless] Generate response keys: {string.Join(", ", swarmResponse.Properties().Select(p => p.Name))}");
             Image[] images = ExtractGeneratedImages(swarmResponse);
-            if (images.Length == 0)
+            if (images.Length is 0)
             {
                 Logs.Verbose($"[RunPodServerless] Generate: no images in response. Full response: {swarmResponse.ToString(Formatting.None)}");
                 throw new Exception("No images returned from generation");
@@ -662,31 +661,20 @@ public class RunPodServerlessBackend : AbstractT2IBackend
     public JObject BuildGenerationRequest(T2IParamInput input, string sessionId)
     {
         Logs.Verbose($"[RunPodServerless] BuildGenerationRequest: sessionId={sessionId?[..Math.Min(16, sessionId?.Length ?? 0)]}...");
-        // Process prompt embeds like SwarmSwarmBackend
         input.ProcessPromptEmbeds(x => $"<embedding:{x}>");
-
-        // Use standard ToJSON() serialization
         JObject request = input.ToJSON();
         Logs.Verbose($"[RunPodServerless] BuildGenerationRequest: base request has {request.Properties().Count()} properties");
-
-        // Set required fields for remote generation
         request["session_id"] = sessionId;
         request[T2IParamTypes.Images.Type.ID] = 1;
         request[T2IParamTypes.DoNotSave.Type.ID] = true;
-
-        // Remove backend selection params - let worker decide
         request.Remove(T2IParamTypes.ExactBackendID.Type.ID);
         request.Remove(T2IParamTypes.BackendType.Type.ID);
-
-        // Forward raw backend data if the caller is listening for it
         if (input.ReceiveRawBackendData is not null)
         {
             request[T2IParamTypes.ForwardRawBackendData.Type.ID] = true;
             Logs.Verbose($"[RunPodServerless] BuildGenerationRequest: forwarding raw backend data");
         }
-        // Forward Swarm metadata (params_used, etc.)
         request[T2IParamTypes.ForwardSwarmData.Type.ID] = true;
-
         Logs.Verbose($"[RunPodServerless] BuildGenerationRequest: final request has {request.Properties().Count()} properties");
         return request;
     }
@@ -696,7 +684,7 @@ public class RunPodServerlessBackend : AbstractT2IBackend
     {
         List<Image> images = [];
         JArray imageArray = response["images"] as JArray;
-        if (imageArray == null || imageArray.Count == 0)
+        if (imageArray is null || imageArray.Count is 0)
         {
             Logs.Verbose($"[RunPodServerless] ExtractGeneratedImages: no 'images' array in response (keys: {string.Join(", ", response.Properties().Select(p => p.Name))})");
             return [];
@@ -706,7 +694,6 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         {
             try
             {
-                // SwarmUI returns images as data strings (e.g., "data:image/png;base64,...")
                 string dataStr = imageToken.ToString();
                 Logs.Verbose($"[RunPodServerless] ExtractGeneratedImages: decoding image ({dataStr.Length} chars)");
                 Image img = ImageFile.FromDataString(dataStr) as Image;
@@ -733,17 +720,14 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         try
         {
             Logs.Verbose($"[RunPodServerless] GetOrWakeWorkerAsync: WorkerLock acquired. CurrentWorker={CurrentWorker?.WorkerId ?? "<null>"}, KeepaliveExpiry={WorkerKeepaliveExpiry}, ActiveKeepaliveJobId={ActiveKeepaliveJobId ?? "<null>"}");
-            // Check if we have an active worker that hasn't expired
-            if (CurrentWorker != null && DateTime.UtcNow < WorkerKeepaliveExpiry)
+            if (CurrentWorker is not null && DateTime.UtcNow < WorkerKeepaliveExpiry)
             {
                 int remainingSeconds = (int)(WorkerKeepaliveExpiry - DateTime.UtcNow).TotalSeconds;
                 Logs.Debug($"[RunPodServerless] Reusing active worker {CurrentWorker.WorkerId} (expires in {remainingSeconds}s)");
-                // Extend keepalive if needed
                 if (remainingSeconds < keepaliveDuration / 2)
                 {
                     Logs.Debug($"[RunPodServerless] Extending keepalive by {keepaliveDuration}s (remaining {remainingSeconds}s < threshold {keepaliveDuration / 2}s)");
                     Logs.Verbose($"[RunPodServerless] Submitting new keepalive job in background (old job: {ActiveKeepaliveJobId ?? "<null>"})");
-                    // Submit new keepalive job; old one may still be running but that's harmless
                     _ = Task.Run(async () =>
                     {
                         try
@@ -765,9 +749,7 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                 }
                 return CurrentWorker;
             }
-
-            // Need to wake up a new worker
-            if (CurrentWorker != null)
+            if (CurrentWorker is not null)
             {
                 Logs.Verbose($"[RunPodServerless] Previous worker {CurrentWorker.WorkerId} has expired (expiry was {WorkerKeepaliveExpiry}), waking new worker");
             }
@@ -816,14 +798,11 @@ public class RunPodServerlessBackend : AbstractT2IBackend
     {
         int maxWaitSeconds = Config.StartupTimeoutSec;
         int pollIntervalMs = Math.Clamp(Config.PollIntervalMs, 1000, 10000);
-        // Step 1: Submit wakeup job — handler returns immediately with connection info
         string wakeupJobId = await client.WakeupWorkerAsync();
         Logs.Info($"[RunPodServerless] Wakeup job {wakeupJobId} submitted. Waiting for worker (max {maxWaitSeconds}s, poll every {pollIntervalMs}ms)...");
-        // Step 2: Poll until COMPLETED — uses GET /status which is free and creates no new jobs
         Logs.Verbose($"[RunPodServerless] WakeupAndWait: starting status polling for job {wakeupJobId}...");
         JObject output = await client.WaitForJobAsync(wakeupJobId, pollIntervalMs, maxWaitSeconds);
         Logs.Verbose($"[RunPodServerless] WakeupAndWait: job completed. Output keys: {string.Join(", ", output.Properties().Select(p => p.Name))}");
-        // Step 3: Extract connection info from the completed wakeup output
         string publicUrl = output["public_url"]?.ToString();
         string sessionId = output["session_id"]?.ToString();
         string workerId = output["worker_id"]?.ToString();
@@ -835,7 +814,6 @@ public class RunPodServerlessBackend : AbstractT2IBackend
             throw new Exception("Wakeup job completed but did not return public_url/session_id.");
         }
         Logs.Info($"[RunPodServerless] Worker ready: {workerId} at {publicUrl} (session: {sessionId?[..Math.Min(16, sessionId.Length)]}...)");
-        // Step 4: Submit keepalive job to keep worker alive (fire-and-forget, store job ID for cancellation)
         try
         {
             ActiveKeepaliveJobId = await client.SubmitKeepaliveAsync(keepaliveDuration, 30);
@@ -877,8 +855,6 @@ public class RunPodServerlessBackend : AbstractT2IBackend
             Logs.Debug($"[RunPodServerless] Worker ready for live generation: {workerInfo.WorkerId} at {workerInfo.PublicUrl}");
             Logs.Verbose($"[RunPodServerless] GenerateLive: worker session={workerInfo.SessionId?[..Math.Min(16, workerInfo.SessionId?.Length ?? 0)]}...");
             await WaitForWorkerBackendsLoadedAsync(client, workerInfo, Config.StartupTimeoutSec);
-
-            // Ensure the model requested in this generation is selected on the worker
             string genModel = null;
             object mobj = user_input.Get(T2IParamTypes.Model);
             if (mobj is T2IModel tmm)
@@ -904,23 +880,14 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                     Logs.Warning($"[RunPodServerless] Failed to select model '{genModel}' before live generation. Proceeding anyway.");
                 }
             }
-
-            // Build request and connect WebSocket
             JObject swarmRequest = BuildGenerationRequest(user_input, workerInfo.SessionId);
             Logs.Verbose($"[RunPodServerless] GenerateLive: connecting WebSocket to {workerInfo.PublicUrl}/API/GenerateText2ImageWS");
-
             await RunWithSession(async () =>
             {
-                ClientWebSocket websocket = await NetworkBackendUtils.ConnectWebsocket(
-                    workerInfo.PublicUrl,
-                    "API/GenerateText2ImageWS",
-                    ws => { /* No special headers needed for worker connection */ }
-                );
+                ClientWebSocket websocket = await NetworkBackendUtils.ConnectWebsocket(workerInfo.PublicUrl, "API/GenerateText2ImageWS", ws => { /* No special headers needed for worker connection */ } );
                 Logs.Verbose($"[RunPodServerless] GenerateLive: WebSocket connected, sending generation request...");
-
                 await websocket.SendJson(swarmRequest, API.WebsocketTimeout);
                 Logs.Verbose($"[RunPodServerless] GenerateLive: request sent, waiting for responses...");
-
                 while (true)
                 {
                     if (user_input.InterruptToken.IsCancellationRequested)
@@ -933,12 +900,10 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                         };
                         await client.CallSwarmUIAsync(workerInfo.PublicUrl, "/API/InterruptAll", interruptReq, timeoutSeconds: 30);
                     }
-
                     JObject response = await websocket.ReceiveJson(Utilities.ExtraLargeMaxReceive, true);
                     if (response is not null)
                     {
                         AutoThrowException(response);
-
                         if (response.TryGetValue("gen_progress", out JToken val) && val is JObject objVal)
                         {
                             if (objVal.ContainsKey("preview"))
@@ -950,10 +915,7 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                                 Logs.Verbose($"[RunPodServerless] Got progress from websocket for {batchId}");
                             }
                             string actualId = batchId;
-                            if (objVal.TryGetValue("batch_index", out JToken batchIndRemote) &&
-                                int.TryParse($"{batchIndRemote}", out int batchIndRemoteParsed) &&
-                                batchIndRemoteParsed > 0 &&
-                                int.TryParse(batchId, out int localInd))
+                            if (objVal.TryGetValue("batch_index", out JToken batchIndRemote) && int.TryParse($"{batchIndRemote}", out int batchIndRemoteParsed) && batchIndRemoteParsed > 0 && int.TryParse(batchId, out int localInd))
                             {
                                 actualId = $"{localInd + batchIndRemoteParsed}";
                             }
@@ -997,17 +959,14 @@ public class RunPodServerlessBackend : AbstractT2IBackend
                             Logs.Verbose($"[RunPodServerless] Got other from websocket: {response}");
                         }
                     }
-
                     if (websocket.CloseStatus.HasValue)
                     {
                         break;
                     }
                 }
-
                 Logs.Verbose($"[RunPodServerless] GenerateLive: WebSocket closed (status: {websocket.CloseStatus}, desc: {websocket.CloseStatusDescription})");
                 await websocket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, Program.GlobalProgramCancel);
             });
-
             Logs.Debug($"[RunPodServerless] Live generation completed successfully");
         }
         catch (SwarmReadableErrorException)
@@ -1022,9 +981,7 @@ public class RunPodServerlessBackend : AbstractT2IBackend
     }
 
     /// <inheritdoc/>
-    public override IEnumerable<string> SupportedFeatures => RemoteFeatureCombo.IsEmpty
-        ? ["text2image"]
-        : RemoteFeatureCombo.Keys;
+    public override IEnumerable<string> SupportedFeatures => RemoteFeatureCombo.IsEmpty ? ["text2image"] : RemoteFeatureCombo.Keys;
 
     /// <summary>Update supported features from remote worker backend data.</summary>
     public void UpdateFeaturesFromWorker(JObject backendData)
@@ -1033,7 +990,7 @@ public class RunPodServerlessBackend : AbstractT2IBackend
         foreach (JToken backend in backendData.Values())
         {
             string status = backend["status"]?.ToString();
-            if (status == "running" && backend["features"] is JArray featureArr)
+            if (status is "running" && backend["features"] is JArray featureArr)
             {
                 features.UnionWith(featureArr.Select(f => f.ToString()));
             }
