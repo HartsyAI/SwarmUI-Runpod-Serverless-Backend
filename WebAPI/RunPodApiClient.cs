@@ -77,7 +77,7 @@ public class RunPodApiClient(string apiKey, string endpointId)
             attempt++;
             JObject result = await GetJobStatusAsync(jobId, cancel);
             string status = result["status"]?.ToString() ?? "UNKNOWN";
-            if (status is not lastStatus)
+            if (status != lastStatus)
             {
                 int elapsed = (int)(DateTime.UtcNow - deadline.AddSeconds(-timeoutSec)).TotalSeconds;
                 Logs.Info($"[RunPodApiClient] Job {jobId}: {status} (after {elapsed}s)");
